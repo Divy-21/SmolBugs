@@ -1,3 +1,14 @@
+// MachineGuard machine1: thermistor + vibration over Bluetooth (BLE)
+//
+// Characteristics (Nordic UART base UUID):
+//   6E400003  temperature  text "sequence,voltage_mV,resistance_ohms" every 500 ms
+//   6E400004  vibration    binary START + DATA frames, one window every VIB_INTERVAL_MS
+//
+// Vibration is capture-then-send: record a 4096-sample window into RAM, then send it
+// as 1 START frame + 128 DATA frames of 32 samples each. Frame format: smolbugs_protocol.h
+//
+// Until the ADXL355 arrives, USE_TEST_SIGNAL generates a synthetic machine vibration
+// so the whole Bluetooth path can be tested end to end.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -15,6 +26,8 @@
 
 const char* MACHINE_ID = "MG-001";
 
+
+#include "smolbugs_protocol.h"
 
 // =====================================================
 // OLED CONFIGURATION
@@ -45,65 +58,6 @@ unsigned long lastSensorUpdate = 0;
 
 
 // =====================================================
-// MINIMU-9 CONFIGURATION
-// =====================================================
-
-// Separate I2C bus from the OLED.
-
-#define IMU_SDA 2
-#define IMU_SCL 4
-
-#define IMU_I2C_FREQUENCY 400000
-
-// I2C addresses
-
-#define LSM303D_ADDRESS 0x1D
-#define L3GD20H_ADDRESS 0x6B
-
-// LSM303D registers
-
-#define LSM303D_WHO_AM_I 0x0F
-#define LSM303D_CTRL1    0x20
-#define LSM303D_CTRL2    0x21
-#define LSM303D_OUT_X_L  0x28
-
-// L3GD20H registers
-
-#define L3GD20H_WHO_AM_I 0x0F
-#define L3GD20H_CTRL1    0x20
-#define L3GD20H_CTRL4    0x23
-#define L3GD20H_OUT_X_L  0x28
-
-// Sensor sensitivity
-
-// LSM303D: +/- 4g
-// 0.122 mg per LSB
-
-const float ACCEL_SENSITIVITY = 0.000122;
-
-// L3GD20H: +/- 245 degrees/second
-// 8.75 mdps per LSB
-
-const float GYRO_SENSITIVITY = 0.00875;
-
-// Sensor availability
-
-bool imuInitialized = false;
-
-// Accelerometer readings (g)
-
-float accelerationX = 0.0;
-float accelerationY = 0.0;
-float accelerationZ = 0.0;
-
-// Gyroscope readings (degrees/second)
-
-float gyroX = 0.0;
-float gyroY = 0.0;
-float gyroZ = 0.0;
-
-
-// =====================================================
 // BLE CONFIGURATION
 // =====================================================
 
@@ -115,9 +69,14 @@ float gyroZ = 0.0;
 #define CHARACTERISTIC_UUID_TX \
     "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
+#define CHARACTERISTIC_UUID_VIBRATION \
+    "6E400004-B5A3-F393-E0A9-E50E24DCCA9E"
+
 BLEServer* bleServer = nullptr;
 
 BLECharacteristic* txCharacteristic = nullptr;
+BLECharacteristic* vibCharacteristic = nullptr;
+BLE2902* vibCccd = nullptr;
 
 volatile bool deviceConnected = false;
 
@@ -146,6 +105,17 @@ class ServerCallbacks : public BLEServerCallbacks {
         Serial.println("BLE client disconnected");
 
         BLEDevice::startAdvertising();
+    }
+};
+
+// Counts failed notifications so the frame gap can be tuned.
+class VibrationCallbacks : public BLECharacteristicCallbacks {
+
+    void onStatus(BLECharacteristic* characteristic, Status s, uint32_t code) override {
+
+        if (s != SUCCESS_NOTIFY) {
+            vibNotifyErrors++;
+        }
     }
 };
 
@@ -467,8 +437,6 @@ void initializeBLE() {
 
     BLEDevice::init(DEVICE_NAME);
 
-    BLEDevice::setMTU(247);
-
     bleServer = BLEDevice::createServer();
 
     bleServer->setCallbacks(
@@ -486,6 +454,20 @@ void initializeBLE() {
 
     txCharacteristic->addDescriptor(
         new BLE2902()
+    );
+
+    vibCharacteristic =
+        uartService->createCharacteristic(
+            CHARACTERISTIC_UUID_VIBRATION,
+            BLECharacteristic::PROPERTY_NOTIFY
+        );
+
+    vibCccd = new BLE2902();
+
+    vibCharacteristic->addDescriptor(vibCccd);
+
+    vibCharacteristic->setCallbacks(
+        new VibrationCallbacks()
     );
 
     uartService->start();
@@ -518,6 +500,49 @@ uint32_t readThermistorVoltage() {
     }
 
     return totalMv / samples;
+}
+
+
+void updateDisplay(uint32_t voltageMv, float resistance) {
+
+    display.clear();
+
+    display.drawString(0, 0, "MachineGuard");
+
+    display.drawString(
+        0,
+        13,
+        "Voltage: " + String(voltageMv) + " mV"
+    );
+
+    if (resistance > 0) {
+
+        display.drawString(
+            0,
+            26,
+            "Resistance: " +
+            String(resistance / 1000.0, 2) +
+            " kOhm"
+        );
+
+    } else {
+
+        display.drawString(0, 26, "Invalid reading");
+    }
+
+    display.drawString(
+        0,
+        39,
+        "Vib windows: " + String(vibWindowsSent)
+    );
+
+    display.drawString(
+        0,
+        52,
+        deviceConnected ? "BLE: Connected" : "BLE: Waiting"
+    );
+
+    display.display();
 }
 
 
@@ -588,34 +613,43 @@ void readSensorsAndTransmit() {
 
 
     // -------------------------------------------------
-    // OLED DISPLAY
+    // OLED OUTPUT
     // -------------------------------------------------
 
     display.clear();
 
     display.drawString(0, 0, "MachineGuard");
 
-    display.drawString(
-        0,
-        13,
-        "Therm: " + String(voltageMv) + " mV"
-    );
+    display.drawString(0, 13, "Thermistor Monitor");
 
     display.drawString(
         0,
-        26,
-        "Accel: " + String(accelerationZ, 2) + " g"
+        27,
+        "Voltage: " + String(voltageMv) + " mV"
     );
+
+    if (resistance > 0) {
+
+        display.drawString(
+            0,
+            41,
+            "Resistance: " +
+            String(resistance / 1000.0, 2) +
+            " kOhm"
+        );
+
+    } else {
+
+        display.drawString(
+            0,
+            41,
+            "Invalid reading"
+        );
+    }
 
     display.drawString(
         0,
-        39,
-        "Gyro: " + String(gyroX, 1) + " dps"
-    );
-
-    display.drawString(
-        0,
-        52,
+        54,
         deviceConnected ? "BLE: Connected" : "BLE: Waiting"
     );
 
@@ -735,13 +769,31 @@ void readSensorsAndTransmit() {
 
         packetCounter++;
 
-        Serial.print("Sending JSON packet ");
-        Serial.println(packetCounter);
+        String message =
+            String(packetCounter) + "," +
+            String(voltageMv) + "," +
+            String((uint32_t)resistance);
 
-        sendJSON(json);
+        txCharacteristic->setValue(
+            message.c_str()
+        );
 
-        Serial.println("JSON transmission complete");
+        txCharacteristic->notify();
+
+        Serial.print("BLE sent: ");
+        Serial.println(message);
     }
+
+    vibWindowsSent++;
+
+    Serial.print("Vibration window ");
+    Serial.print(vibWindowId);
+    Serial.print(" sent in ");
+    Serial.print(millis() - started);
+    Serial.print(" ms, notify errors: ");
+    Serial.println(vibNotifyErrors - errorsBefore);
+
+    vibWindowId++;  // uint16_t wraps at 65535, as the protocol expects
 }
 
 
@@ -756,7 +808,7 @@ void setup() {
     delay(1000);
 
     Serial.println();
-    Serial.println("MachineGuard Sensor + BLE");
+    Serial.println("MachineGuard Thermistor + BLE");
     Serial.println("--------------------------------");
 
 
@@ -815,7 +867,7 @@ void setup() {
 
     display.drawString(0, 0, "MachineGuard");
 
-    display.drawString(0, 16, "Sensor + BLE");
+    display.drawString(0, 16, "Thermistor + BLE");
 
     display.drawString(
         0,
@@ -826,15 +878,7 @@ void setup() {
     display.display();
 
 
-    Serial.println();
     Serial.println("Thermistor initialized");
-
-    Serial.println(
-        imuInitialized
-        ? "MinIMU-9 initialized"
-        : "MinIMU-9 initialization failed"
-    );
-
     Serial.println("System ready");
 }
 
@@ -850,6 +894,15 @@ void loop() {
         lastSensorUpdate = millis();
 
         readSensorsAndTransmit();
+    }
+
+    if (millis() - lastVibWindow >= VIB_INTERVAL_MS) {
+
+        lastVibWindow = millis();
+
+        if (vibrationReady()) {
+            sendVibrationWindow();
+        }
     }
 
     delay(10);
