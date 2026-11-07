@@ -1,0 +1,1 @@
+"""Synthetic signals and demos for testing without hardware."""
