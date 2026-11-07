@@ -9,7 +9,7 @@ ESP32 (machine1)  →  Bluetooth  →  [ receiver → reassemble → FFT analysi
                                      ▲ you are here
 ```
 
-**Current status:** the accelerometer (ADXL355) hasn't arrived yet, so the firmware sends a generated test vibration signal over Bluetooth instead. Everything else runs for real: the thermistor readings, the Bluetooth link, decoding, and FFT analysis.
+**Current status:** running on real hardware. A Pololu MinIMU-9 (LSM303D accelerometer) samples vibration at about 1,600 Hz, and a thermistor measures temperature. Both travel over Bluetooth to the receiver, which runs the FFT analysis.
 
 ## Why an FFT?
 
@@ -42,13 +42,14 @@ predictive-maintenance/
 │   └── __init__.py         Lets you `from processing import ...`
 ├── ingest/
 │   ├── ble_receiver.py     Connects to the board over Bluetooth, runs everything
+│   ├── cloud.py            Reading IDs and background upload to the SmolBugs cloud
 │   └── fft_report.py       Interactive FFT report from a recorded session
 ├── simulation/
 │   ├── synthetic.py        Fake vibration signals with known answers
 │   ├── packet_simulator.py Fake healthy/faulty machine windows
 │   ├── fake_ble_board.py   Pretend Bluetooth board, for running without hardware
 │   └── fft_demo.py         Interactive demo: healthy vs faulty machine
-├── tests/                  126 automated tests
+├── tests/                  164 automated tests
 └── pytest.ini          Test configuration
 ```
 
@@ -75,7 +76,7 @@ If the `.venv` folder doesn't exist yet, create it from `E:\SmolBugs` with `pyth
 python -m pytest -q
 ```
 
-Expected result: `119 passed, 7 skipped` on Windows. The 7 skipped tests compile the ESP32 firmware on the PC and only run where a C++ compiler (`g++`) is installed; with one, all 126 run.
+Expected result: `153 passed, 11 skipped` on Windows. The 11 skipped tests compile the ESP32 firmware on the PC and only run where a C++ compiler (`g++`) is installed; with one, all 164 run.
 
 The FFT tests feed in signals where the right answer is already known (for example, "a 0.5 g vibration at exactly 123.37 Hz") and check that the FFT gets it back. They confirm that frequencies come out within 0.01 Hz and amplitudes within 0.5%.
 
@@ -133,6 +134,36 @@ Vib   window     0 | dominant   50.00 Hz @ 0.050 g | velocity 1.12 mm/s | 1x=0.0
 
 With `--out`, the folder gets `temperature.jsonl` and `vibration.jsonl` (one result per line) and a `windows/` folder of raw data (`.npz`), which will become training data for anomaly detection. Press Ctrl+C to stop; a summary of anything lost or rejected is printed at the end.
 
+## Sending data to the cloud
+
+Add `--cloud` to send every status reading and analysed window to the SmolBugs cloud as well. The address and key come from environment variables, so the key never goes into a file or into git. In PowerShell:
+
+```powershell
+$env:CLOUD_URL  = "https://sm-db6bb08ece0d477c9e820f118f7e670c.ecs.ca-central-1.on.aws"
+$env:DEVICE_KEY = "paste-the-key-here"      # lasts until this window is closed
+python -m ingest.ble_receiver --cloud --rpm 3000
+python -m ingest.ble_receiver --cloud --simulate    # try it without the board
+```
+
+Status readings go to `POST /api/v1/status` and windows (the `analyze_window` results, plus the latest `temperature_c`) to `POST /api/v1/windows`, with the key in the `x-device-key` header.
+
+**Reading IDs.** The board's `timestamp_ms` is time since power-on: it restarts at 0 on every reboot, and two machines can have the same value. So every reading gets three extra fields:
+
+| Field | Where it comes from |
+|---|---|
+| `boot_id` | The firmware's `boot_id` if it sends one. Otherwise the receiver makes one (8 hex characters) when it connects, and a new one whenever that machine's clock goes backwards, which means the board rebooted. |
+| `seq` | The firmware's `seq`/`sequence` if present, and `window_id` for windows. Otherwise a counter per machine and boot, starting at 0. |
+| `packet_id` | `sha256("machine_id|boot_id|kind|seq")`, first 32 characters, where kind is `status` or `window`. |
+
+Sensor values are deliberately not part of the ID: two real readings can have identical values, and a retried upload must keep the same ID so the cloud can recognise duplicates. `timestamp_ms` and `received_at_utc` are kept as they were. The same fields are written to the `--out` files.
+
+**When the internet drops.** Uploading runs in the background, so Bluetooth handling never waits on the network. Packets are sent in batches of up to 50 at least once a second.
+- **Failed upload** (timeout, server error, no connection): the packets are kept and retried with growing pauses (1 s, 2 s, 4 s … up to 60 s), with the same `packet_id`s.
+- **Backlog limit:** about 10 minutes of data (2,000 packets). Beyond that, the oldest are dropped and the number dropped is printed.
+- **400 Bad Request:** the server's `details` are printed and that packet is dropped, since retrying won't fix it. The rest of its batch is still sent.
+- **401 Unauthorized:** the key is wrong. A clear message is printed and packets are kept. Fix `DEVICE_KEY` and restart.
+- On Ctrl+C the receiver tries for a few seconds to upload what's left, then prints a summary.
+
 ## Viewing the FFT from the board
 
 Record with `--out`, then build an interactive report from what was saved:
@@ -162,9 +193,9 @@ Keep `plotly.min.js` next to `fft_report.html` in the session folder; the report
 
 ## How vibration travels over Bluetooth
 
-The FFT needs 4,096 readings taken at a steady 4,000 per second, which is about 24 KB of data. Streaming that continuously is more than a Bluetooth link to a laptop can reliably carry, so the board works in **capture-then-send** cycles:
+The FFT needs 4,096 readings taken at a steady rate, which is about 24 KB of data. Streaming that continuously is more than a Bluetooth link to a laptop can reliably carry, so the board works in **capture-then-send** cycles:
 
-1. Record one window (4,096 readings, about 1 second) into memory.
+1. Record one window (4,096 readings at about 1,600 per second, so 2.56 seconds) into memory.
 2. Send it as 1 START message followed by 128 DATA messages of 32 readings each (about 1.3 seconds).
 3. Wait, then repeat every 10 seconds.
 
@@ -178,7 +209,7 @@ DATA (197 bytes):
   type=2 | window_id | message number (0–127) | 32 × (x, y, z) as 2-byte integers
 ```
 
-Each reading is stored as a whole number of 1/16,000 g (62.5 µg), far finer than machinery vibration needs. The full byte layout is documented at the top of `processing/ble_protocol.py` and in `smolbugs_protocol.h` in the firmware folder. Tests check that both sides produce identical bytes.
+Each reading is the LSM303D's own 16-bit value (0.122 mg per step at ±4 g). The START message carries the scale, range and the measured sample rate, so the receiver converts correctly. The full byte layout is documented at the top of `processing/ble_protocol.py` and in `smolbugs_protocol.h` in the firmware folder. Tests check that both sides produce identical bytes.
 
 **Bluetooth MTU:** one 197-byte message needs the link's MTU (maximum message size) to be at least 200. The default is only 23, so the board requests 247 and Windows normally agrees. The receiver prints the MTU when it connects. If it's too small, the board skips vibration rather than sending cut-off messages, and the receiver prints a warning.
 
@@ -186,12 +217,16 @@ Each reading is stored as a whole number of 1/16,000 g (62.5 µg), far finer tha
 
 ## Firmware (machine1)
 
-`hardware scripts/machine1/machine1/` contains `machine1.ino` and `smolbugs_protocol.h`, which must stay in the same folder. On top of the existing thermistor, OLED and Bluetooth code, it adds:
+`hardware scripts/machine1/machine1/` contains `machine1.ino` and `smolbugs_protocol.h`, which must stay in the same folder. The board is a Heltec ESP32 with a Pololu MinIMU-9 v3 (LSM303D accelerometer) on its second I2C bus (`Wire1`, SDA GPIO2, SCL GPIO4). The OLED uses the first bus (`Wire`, GPIO17/18); starting `Wire` again on other pins is silently ignored by the ESP32, which is why the accelerometer needs `Wire1`.
 
-- A second Bluetooth characteristic (`6E400004-…`) for vibration. Temperature keeps its original one (`6E400003-…`) and message format.
-- Capture-then-send, every `VIB_INTERVAL_MS` (10 s), only while a receiver is subscribed.
-- `USE_TEST_SIGNAL 1`: generates a 3,000 RPM machine signal (0.05 g at 50 Hz, 0.01 g at 100 Hz, noise, 1 g gravity on z) until the ADXL355 arrives. When it does, set this to `0` and fill in `captureWindow()`.
-- The window count on the OLED, and send time and error counts on the serial monitor.
+What the firmware does:
+
+- **Status message every 500 ms** on characteristic `6E400003-…`: `sequence,voltage_mV,x_g,y_g,z_g` (thermistor voltage plus a single accelerometer reading).
+- **A vibration window every 10 s** on characteristic `6E400004-…`, only while a receiver is subscribed. The LSM303D runs at 1,600 Hz with its 362 Hz anti-alias filter, and readings are collected through its 32-reading FIFO buffer. That keeps their spacing exact even if the ESP32 is briefly busy. If it's busy for more than about 20 ms the buffer overflows; that window is discarded rather than sent with a gap, and the next one is captured normally.
+- **The sensor's real sample rate is measured** for every window and sent with it, so frequencies stay accurate even though the LSM303D's clock can be a few percent off.
+- The window count on the OLED; send time, rate and error counts on the serial monitor.
+
+What the 1,600 Hz rate means for analysis: frequency resolution is 0.39 Hz, and vibration up to about **360 Hz** is captured accurately (the anti-alias filter). Above that, readings are increasingly filtered out, so the 500–1000 Hz band in the results will stay near zero.
 
 Settings near the top of the sketch:
 
@@ -199,8 +234,8 @@ Settings near the top of the sketch:
 |---|---|---|
 | `VIB_INTERVAL_MS` | 10000 | Time between windows |
 | `VIB_FRAME_GAP_MS` | 10 | Pause between messages; lower is faster but risks drops |
-| `VIB_SAMPLE_RATE_HZ` | 4000 | Replace with the sensor's measured rate once it's fitted |
-| `VIB_RANGE_G` | 2 | Accelerometer range (2, 4 or 8 g) |
+| `VIB_WINDOW_SAMPLES` | 4096 | Readings per window (2.56 s at 1,600 Hz) |
+| `VIB_RANGE_G` / `VIB_LSB_PER_G` | 4 / 8197 | Must match CTRL2's full-scale setting |
 
 ## Temperature
 

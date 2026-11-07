@@ -1,31 +1,21 @@
-// MachineGuard machine1: thermistor + vibration over Bluetooth (BLE)
+// MachineGuard machine1: thermistor + LSM303D accelerometer over Bluetooth (BLE)
 //
 // Characteristics (Nordic UART base UUID):
-//   6E400003  temperature  text "sequence,voltage_mV,resistance_ohms" every 500 ms
-//   6E400004  vibration    binary START + DATA frames, one window every VIB_INTERVAL_MS
+//   6E400003  status     text "sequence,voltage_mV,x_g,y_g,z_g" every 500 ms
+//   6E400004  vibration  binary START + DATA frames (smolbugs_protocol.h):
+//                        one 4096-sample window at ~1600 Hz every VIB_INTERVAL_MS
 //
-// Vibration is capture-then-send: record a 4096-sample window into RAM, then send it
-// as 1 START frame + 128 DATA frames of 32 samples each. Frame format: smolbugs_protocol.h
-//
-// Until the ADXL355 arrives, USE_TEST_SIGNAL generates a synthetic machine vibration
-// so the whole Bluetooth path can be tested end to end.
+// smolbugs_protocol.h must be in the same folder as this sketch.
 
 #include <Arduino.h>
-#include <Wire.h>
 #include "HT_SSD1306Wire.h"
+
+#include <Wire.h>
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-
-
-// =====================================================
-// MACHINE CONFIGURATION
-// =====================================================
-
-const char* MACHINE_ID = "MG-001";
-
 
 #include "smolbugs_protocol.h"
 
@@ -49,12 +39,67 @@ static SSD1306Wire display(
 
 const int THERMISTOR_PIN = 1;
 
-const float FIXED_RESISTOR = 75000.0;
-const float SUPPLY_VOLTAGE = 3.3;
-
 const unsigned long SENSOR_INTERVAL = 500;
 
 unsigned long lastSensorUpdate = 0;
+
+
+// =====================================================
+// ACCELEROMETER CONFIGURATION
+// =====================================================
+
+// MinIMU-9 LSM303D
+
+#define IMU_SDA 2
+#define IMU_SCL 4
+
+// The OLED already uses Wire (pins 17/18). Calling Wire.begin() again with other
+// pins is ignored on the ESP32, so the IMU gets its own second I2C bus.
+#define IMU_WIRE Wire1
+
+#define LSM303D_ADDRESS 0x1D
+
+#define LSM303D_WHO_AM_I 0x0F
+#define LSM303D_CTRL1    0x20
+#define LSM303D_CTRL2    0x21
+#define LSM303D_OUT_X_L  0x28
+
+// +/- 4g sensitivity: 0.122 mg/LSB
+
+const float ACCEL_SENSITIVITY = 0.000122;
+
+bool accelerometerInitialized = false;
+
+float accelerationX = 0.0;
+float accelerationY = 0.0;
+float accelerationZ = 0.0;
+
+// FIFO registers, used while capturing vibration windows.
+#define LSM303D_CTRL0     0x1F
+#define LSM303D_FIFO_CTRL 0x2E
+#define LSM303D_FIFO_SRC  0x2F
+
+
+// =====================================================
+// VIBRATION CAPTURE CONFIGURATION
+// =====================================================
+
+const float    VIB_NOMINAL_RATE_HZ = 1600.0f; // CTRL1 = 0xA7
+const uint16_t VIB_WINDOW_SAMPLES  = 4096;    // 2.56 s at 1600 Hz, 0.39 Hz resolution
+const uint8_t  VIB_RANGE_G         = 4;       // CTRL2 full scale
+const uint16_t VIB_LSB_PER_G       = 8197;    // 1 / 0.122 mg per LSB at +/-4 g
+
+const unsigned long VIB_INTERVAL_MS  = 10000; // one window every 10 s
+const unsigned long VIB_FRAME_GAP_MS = 10;    // pause between DATA frames
+
+// 4096 x 3 x 2 bytes = 24 KB of RAM.
+static int16_t vibBuffer[VIB_WINDOW_SAMPLES][3];
+
+uint16_t vibWindowId = 0;
+uint32_t vibWindowsSent = 0;
+uint32_t vibCaptureFailures = 0;
+uint32_t vibNotifyErrors = 0;
+unsigned long lastVibWindow = 0;
 
 
 // =====================================================
@@ -82,11 +127,9 @@ volatile bool deviceConnected = false;
 
 uint32_t packetCounter = 0;
 
-const size_t BLE_CHUNK_SIZE = 20;
-
 
 // =====================================================
-// BLE CALLBACKS
+// BLE CONNECTION CALLBACKS
 // =====================================================
 
 class ServerCallbacks : public BLEServerCallbacks {
@@ -108,7 +151,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     }
 };
 
-// Counts failed notifications so the frame gap can be tuned.
+// Counts failed vibration notifications so VIB_FRAME_GAP_MS can be tuned.
 class VibrationCallbacks : public BLECharacteristicCallbacks {
 
     void onStatus(BLECharacteristic* characteristic, Status s, uint32_t code) override {
@@ -133,309 +176,15 @@ void VextON() {
 
 
 // =====================================================
-// I2C REGISTER FUNCTIONS
-// =====================================================
-
-bool writeRegister(
-    uint8_t address,
-    uint8_t reg,
-    uint8_t value
-) {
-
-    Wire.beginTransmission(address);
-
-    Wire.write(reg);
-    Wire.write(value);
-
-    return Wire.endTransmission() == 0;
-}
-
-
-bool readRegisters(
-    uint8_t address,
-    uint8_t reg,
-    uint8_t* buffer,
-    size_t length
-) {
-
-    Wire.beginTransmission(address);
-
-    // Enable register address auto-increment.
-    Wire.write(reg | 0x80);
-
-    if (Wire.endTransmission(false) != 0) {
-        return false;
-    }
-
-    size_t received = Wire.requestFrom(
-        address,
-        length
-    );
-
-    if (received != length) {
-        return false;
-    }
-
-    for (size_t i = 0; i < length; i++) {
-        buffer[i] = Wire.read();
-    }
-
-    return true;
-}
-
-
-uint8_t readRegister(
-    uint8_t address,
-    uint8_t reg
-) {
-
-    uint8_t value = 0;
-
-    Wire.beginTransmission(address);
-
-    Wire.write(reg);
-
-    if (Wire.endTransmission(false) != 0) {
-        return 0;
-    }
-
-    if (Wire.requestFrom(address, (uint8_t)1) != 1) {
-        return 0;
-    }
-
-    value = Wire.read();
-
-    return value;
-}
-
-
-// =====================================================
-// MINIMU-9 INITIALIZATION
-// =====================================================
-
-bool initializeIMU() {
-
-    Serial.println();
-    Serial.println("Initializing MinIMU-9...");
-
-    // Verify LSM303D identity.
-
-    uint8_t accelID = readRegister(
-        LSM303D_ADDRESS,
-        LSM303D_WHO_AM_I
-    );
-
-    Serial.print("LSM303D WHO_AM_I: 0x");
-    Serial.println(accelID, HEX);
-
-    if (accelID != 0x49) {
-
-        Serial.println("ERROR: LSM303D not detected");
-
-        return false;
-    }
-
-
-    // Verify L3GD20H identity.
-
-    uint8_t gyroID = readRegister(
-        L3GD20H_ADDRESS,
-        L3GD20H_WHO_AM_I
-    );
-
-    Serial.print("L3GD20H WHO_AM_I: 0x");
-    Serial.println(gyroID, HEX);
-
-    if (gyroID != 0xD7) {
-
-        Serial.println("ERROR: L3GD20H not detected");
-
-        return false;
-    }
-
-
-    // -------------------------------------------------
-    // CONFIGURE ACCELEROMETER
-    // -------------------------------------------------
-
-    // CTRL1 = 0x57
-    //
-    // Output data rate: 50 Hz
-    // X axis enabled
-    // Y axis enabled
-    // Z axis enabled
-
-    if (!writeRegister(
-        LSM303D_ADDRESS,
-        LSM303D_CTRL1,
-        0x57
-    )) {
-        return false;
-    }
-
-
-    // CTRL2 = 0x08
-    //
-    // Accelerometer full scale: +/- 4g
-
-    if (!writeRegister(
-        LSM303D_ADDRESS,
-        LSM303D_CTRL2,
-        0x08
-    )) {
-        return false;
-    }
-
-
-    // -------------------------------------------------
-    // CONFIGURE GYROSCOPE
-    // -------------------------------------------------
-
-    // CTRL1 = 0x0F
-    //
-    // Output data rate: 95 Hz
-    // Power on
-    // X, Y, Z axes enabled
-
-    if (!writeRegister(
-        L3GD20H_ADDRESS,
-        L3GD20H_CTRL1,
-        0x0F
-    )) {
-        return false;
-    }
-
-
-    // CTRL4 = 0x00
-    //
-    // Full scale: +/- 245 degrees/second
-
-    if (!writeRegister(
-        L3GD20H_ADDRESS,
-        L3GD20H_CTRL4,
-        0x00
-    )) {
-        return false;
-    }
-
-
-    Serial.println("LSM303D initialized");
-    Serial.println("L3GD20H initialized");
-
-    Serial.println("Accelerometer: +/- 4g");
-    Serial.println("Gyroscope: +/- 245 dps");
-
-    return true;
-}
-
-
-// =====================================================
-// ACCELEROMETER READING
-// =====================================================
-
-bool readAccelerometer() {
-
-    uint8_t buffer[6];
-
-    if (!readRegisters(
-        LSM303D_ADDRESS,
-        LSM303D_OUT_X_L,
-        buffer,
-        6
-    )) {
-        return false;
-    }
-
-    // Combine low and high bytes.
-
-    int16_t rawX =
-        (int16_t)((buffer[1] << 8) | buffer[0]);
-
-    int16_t rawY =
-        (int16_t)((buffer[3] << 8) | buffer[2]);
-
-    int16_t rawZ =
-        (int16_t)((buffer[5] << 8) | buffer[4]);
-
-
-    // Convert raw values into g.
-
-    accelerationX = rawX * ACCEL_SENSITIVITY;
-
-    accelerationY = rawY * ACCEL_SENSITIVITY;
-
-    accelerationZ = rawZ * ACCEL_SENSITIVITY;
-
-    return true;
-}
-
-
-// =====================================================
-// GYROSCOPE READING
-// =====================================================
-
-bool readGyroscope() {
-
-    uint8_t buffer[6];
-
-    if (!readRegisters(
-        L3GD20H_ADDRESS,
-        L3GD20H_OUT_X_L,
-        buffer,
-        6
-    )) {
-        return false;
-    }
-
-    // Combine low and high bytes.
-
-    int16_t rawX =
-        (int16_t)((buffer[1] << 8) | buffer[0]);
-
-    int16_t rawY =
-        (int16_t)((buffer[3] << 8) | buffer[2]);
-
-    int16_t rawZ =
-        (int16_t)((buffer[5] << 8) | buffer[4]);
-
-
-    // Convert raw values into degrees/second.
-
-    gyroX = rawX * GYRO_SENSITIVITY;
-
-    gyroY = rawY * GYRO_SENSITIVITY;
-
-    gyroZ = rawZ * GYRO_SENSITIVITY;
-
-    return true;
-}
-
-
-// =====================================================
-// READ ALL IMU SENSORS
-// =====================================================
-
-bool readIMU() {
-
-    if (!imuInitialized) {
-        return false;
-    }
-
-    bool accelOK = readAccelerometer();
-
-    bool gyroOK = readGyroscope();
-
-    return accelOK && gyroOK;
-}
-
-
-// =====================================================
 // BLE INITIALIZATION
 // =====================================================
 
 void initializeBLE() {
 
     BLEDevice::init(DEVICE_NAME);
+
+    // Ask for a large MTU so a 197-byte DATA frame fits in one notification.
+    BLEDevice::setMTU(247);
 
     bleServer = BLEDevice::createServer();
 
@@ -481,6 +230,200 @@ void initializeBLE() {
 
 
 // =====================================================
+// I2C REGISTER FUNCTIONS
+// =====================================================
+
+bool writeRegister(
+    uint8_t address,
+    uint8_t reg,
+    uint8_t value
+) {
+
+    IMU_WIRE.beginTransmission(address);
+
+    IMU_WIRE.write(reg);
+    IMU_WIRE.write(value);
+
+    return IMU_WIRE.endTransmission() == 0;
+}
+
+
+bool readRegisters(
+    uint8_t address,
+    uint8_t reg,
+    uint8_t* buffer,
+    size_t length
+) {
+
+    IMU_WIRE.beginTransmission(address);
+
+    // Enable register auto-increment.
+    IMU_WIRE.write(reg | 0x80);
+
+    if (IMU_WIRE.endTransmission(false) != 0) {
+        return false;
+    }
+
+    if (IMU_WIRE.requestFrom(address, length) != length) {
+        return false;
+    }
+
+    for (size_t i = 0; i < length; i++) {
+        buffer[i] = IMU_WIRE.read();
+    }
+
+    return true;
+}
+
+
+uint8_t readRegister(
+    uint8_t address,
+    uint8_t reg
+) {
+
+    IMU_WIRE.beginTransmission(address);
+
+    IMU_WIRE.write(reg);
+
+    if (IMU_WIRE.endTransmission(false) != 0) {
+        return 0;
+    }
+
+    if (IMU_WIRE.requestFrom(address, (uint8_t)1) != 1) {
+        return 0;
+    }
+
+    return IMU_WIRE.read();
+}
+
+
+// =====================================================
+// I2C SCAN (debug: prints every device on the IMU bus)
+// =====================================================
+
+void scanIMUBus() {
+
+    Serial.println("Scanning IMU I2C bus...");
+
+    int found = 0;
+
+    for (uint8_t address = 1; address < 127; address++) {
+
+        IMU_WIRE.beginTransmission(address);
+
+        if (IMU_WIRE.endTransmission() == 0) {
+
+            Serial.print("Found device at 0x");
+            Serial.println(address, HEX);
+
+            found++;
+        }
+    }
+
+    // MinIMU-9 v3 should show 0x1D (LSM303D) and 0x6B (L3GD20H).
+    if (found == 0) {
+        Serial.println("No devices found: check VIN, GND, SDA->GPIO2, SCL->GPIO4");
+    }
+}
+
+
+// =====================================================
+// ACCELEROMETER INITIALIZATION
+// =====================================================
+
+bool initializeAccelerometer() {
+
+    Serial.println("Initializing LSM303D...");
+
+    uint8_t deviceID = readRegister(
+        LSM303D_ADDRESS,
+        LSM303D_WHO_AM_I
+    );
+
+    Serial.print("LSM303D WHO_AM_I: 0x");
+    Serial.println(deviceID, HEX);
+
+    if (deviceID != 0x49) {
+
+        Serial.println("ERROR: LSM303D not detected");
+
+        return false;
+    }
+
+    // CTRL1 = 0xA7
+    // 1600 Hz output data rate (fast enough for vibration).
+    // Enable X, Y and Z axes.
+
+    if (!writeRegister(
+        LSM303D_ADDRESS,
+        LSM303D_CTRL1,
+        0xA7
+    )) {
+        return false;
+    }
+
+    // CTRL2 = 0x88
+    // Anti-alias filter 362 Hz (bits 7:6 = 10), full scale +/- 4g.
+    // At 1600 Hz the FFT can only represent up to 800 Hz; the filter stops
+    // higher vibration from folding back as false peaks.
+
+    if (!writeRegister(
+        LSM303D_ADDRESS,
+        LSM303D_CTRL2,
+        0x88
+    )) {
+        return false;
+    }
+
+    // FIFO off until a vibration window is captured.
+
+    writeRegister(LSM303D_ADDRESS, LSM303D_FIFO_CTRL, 0x00);
+    writeRegister(LSM303D_ADDRESS, LSM303D_CTRL0, 0x00);
+
+    Serial.println("LSM303D initialized");
+    Serial.println("Range: +/- 4g");
+
+    return true;
+}
+
+
+// =====================================================
+// ACCELEROMETER READING
+// =====================================================
+
+bool readAccelerometer() {
+
+    uint8_t buffer[6];
+
+    if (!readRegisters(
+        LSM303D_ADDRESS,
+        LSM303D_OUT_X_L,
+        buffer,
+        6
+    )) {
+        return false;
+    }
+
+    int16_t rawX =
+        (int16_t)((buffer[1] << 8) | buffer[0]);
+
+    int16_t rawY =
+        (int16_t)((buffer[3] << 8) | buffer[2]);
+
+    int16_t rawZ =
+        (int16_t)((buffer[5] << 8) | buffer[4]);
+
+    // Convert raw readings into g.
+
+    accelerationX = rawX * ACCEL_SENSITIVITY;
+    accelerationY = rawY * ACCEL_SENSITIVITY;
+    accelerationZ = rawZ * ACCEL_SENSITIVITY;
+
+    return true;
+}
+
+
+// =====================================================
 // THERMISTOR READING
 // =====================================================
 
@@ -503,178 +446,37 @@ uint32_t readThermistorVoltage() {
 }
 
 
-void updateDisplay(uint32_t voltageMv, float resistance) {
-
-    display.clear();
-
-    display.drawString(0, 0, "MachineGuard");
-
-    display.drawString(
-        0,
-        13,
-        "Voltage: " + String(voltageMv) + " mV"
-    );
-
-    if (resistance > 0) {
-
-        display.drawString(
-            0,
-            26,
-            "Resistance: " +
-            String(resistance / 1000.0, 2) +
-            " kOhm"
-        );
-
-    } else {
-
-        display.drawString(0, 26, "Invalid reading");
-    }
-
-    display.drawString(
-        0,
-        39,
-        "Vib windows: " + String(vibWindowsSent)
-    );
-
-    display.drawString(
-        0,
-        52,
-        deviceConnected ? "BLE: Connected" : "BLE: Waiting"
-    );
-
-    display.display();
-}
-
-
 // =====================================================
-// JSON TRANSMISSION
+// SENSOR READING
 // =====================================================
 
-void sendJSON(const char* json) {
+void readSensors() {
 
-    if (!deviceConnected) {
-        return;
-    }
-
-    size_t length = strlen(json);
-
-    size_t offset = 0;
-
-    while (offset < length && deviceConnected) {
-
-        size_t chunkLength = min(
-            BLE_CHUNK_SIZE,
-            length - offset
-        );
-
-        txCharacteristic->setValue(
-            (uint8_t*)(json + offset),
-            chunkLength
-        );
-
-        txCharacteristic->notify();
-
-        offset += chunkLength;
-
-        delay(10);
-    }
-}
-
-
-// =====================================================
-// SENSOR DATA AND JSON GENERATION
-// =====================================================
-
-void readSensorsAndTransmit() {
-
-    // -------------------------------------------------
-    // READ THERMISTOR
-    // -------------------------------------------------
+    // Read thermistor voltage.
 
     uint32_t voltageMv = readThermistorVoltage();
 
-    float voltage = voltageMv / 1000.0;
 
-    bool thermistorOK =
-        voltage > 0.01 &&
-        voltage < SUPPLY_VOLTAGE - 0.01;
+    // Read accelerometer.
 
+    bool accelOK = false;
 
-    // -------------------------------------------------
-    // READ IMU
-    // -------------------------------------------------
-
-    bool imuOK = readIMU();
-
-
-    // Device uptime timestamp.
-
-    uint32_t timestampMs = millis();
-
-
-    // -------------------------------------------------
-    // OLED OUTPUT
-    // -------------------------------------------------
-
-    display.clear();
-
-    display.drawString(0, 0, "MachineGuard");
-
-    display.drawString(0, 13, "Thermistor Monitor");
-
-    display.drawString(
-        0,
-        27,
-        "Voltage: " + String(voltageMv) + " mV"
-    );
-
-    if (resistance > 0) {
-
-        display.drawString(
-            0,
-            41,
-            "Resistance: " +
-            String(resistance / 1000.0, 2) +
-            " kOhm"
-        );
-
-    } else {
-
-        display.drawString(
-            0,
-            41,
-            "Invalid reading"
-        );
+    if (accelerometerInitialized) {
+        accelOK = readAccelerometer();
     }
 
-    display.drawString(
-        0,
-        54,
-        deviceConnected ? "BLE: Connected" : "BLE: Waiting"
-    );
-
-    display.display();
-
 
     // -------------------------------------------------
-    // SERIAL DEBUG OUTPUT
+    // SERIAL OUTPUT
     // -------------------------------------------------
-
-    Serial.println();
-    Serial.println("--------------------------------");
-
-    Serial.print("Timestamp: ");
-    Serial.print(timestampMs);
-    Serial.println(" ms");
 
     Serial.print("Thermistor: ");
     Serial.print(voltageMv);
-    Serial.print(" mV | ");
-    Serial.println(thermistorOK ? "OK" : "ERROR");
+    Serial.println(" mV");
 
-    Serial.print("Accelerometer: ");
+    Serial.print("Acceleration: ");
 
-    if (imuOK) {
+    if (accelOK) {
 
         Serial.print("X=");
         Serial.print(accelerationX, 3);
@@ -687,78 +489,63 @@ void readSensorsAndTransmit() {
 
         Serial.println(" g");
 
-        Serial.print("Gyroscope: ");
-
-        Serial.print("X=");
-        Serial.print(gyroX, 2);
-
-        Serial.print(" Y=");
-        Serial.print(gyroY, 2);
-
-        Serial.print(" Z=");
-        Serial.print(gyroZ, 2);
-
-        Serial.println(" dps");
-
     } else {
 
-        Serial.println("ERROR: IMU unavailable");
+        Serial.println("ERROR");
     }
 
 
     // -------------------------------------------------
-    // JSON GENERATION
+    // OLED OUTPUT
     // -------------------------------------------------
 
-    char json[384];
+    display.clear();
 
-    snprintf(
-        json,
-        sizeof(json),
+    display.drawString(0, 0, "MachineGuard");
 
-        "{\"machine_id\":\"%s\","
-        "\"timestamp_ms\":%lu,"
-        "\"sensors\":["
-
-            "{\"id\":\"sensor_0\","
-            "\"type\":\"thermistor\","
-            "\"voltage_mv\":%lu,"
-
-            "\"valid\":%s},"
-
-            "{\"id\":\"sensor_1\","
-            "\"type\":\"accelerometer\","
-            "\"x_g\":%.3f,"
-            "\"y_g\":%.3f,"
-            "\"z_g\":%.3f,"
-            "\"valid\":%s},"
-
-            "{\"id\":\"sensor_2\","
-            "\"type\":\"gyroscope\","
-            "\"x_dps\":%.2f,"
-            "\"y_dps\":%.2f,"
-            "\"z_dps\":%.2f,"
-            "\"valid\":%s}"
-
-        "]}\n",
-
-        MACHINE_ID,
-
-        (unsigned long)timestampMs,
-
-        (unsigned long)voltageMv,
-        thermistorOK ? "true" : "false",
-
-        accelerationX,
-        accelerationY,
-        accelerationZ,
-        imuOK ? "true" : "false",
-
-        gyroX,
-        gyroY,
-        gyroZ,
-        imuOK ? "true" : "false"
+    display.drawString(
+        0,
+        16,
+        "Thermistor: " + String(voltageMv) + " mV"
     );
+
+    // All three acceleration axes on one line.
+
+    if (accelOK) {
+
+        String accelLine =
+            "X:" + String(accelerationX, 2) +
+            " Y:" + String(accelerationY, 2) +
+            " Z:" + String(accelerationZ, 2);
+
+        display.drawString(
+            0,
+            32,
+            accelLine
+        );
+
+    } else {
+
+        display.drawString(
+            0,
+            32,
+            "Accelerometer: ERROR"
+        );
+    }
+
+    display.drawString(
+        0,
+        42,
+        "Vib windows: " + String(vibWindowsSent)
+    );
+
+    display.drawString(
+        0,
+        52,
+        deviceConnected ? "BLE: Connected" : "BLE: Waiting"
+    );
+
+    display.display();
 
 
     // -------------------------------------------------
@@ -772,7 +559,9 @@ void readSensorsAndTransmit() {
         String message =
             String(packetCounter) + "," +
             String(voltageMv) + "," +
-            String((uint32_t)resistance);
+            String(accelerationX, 3) + "," +
+            String(accelerationY, 3) + "," +
+            String(accelerationZ, 3);
 
         txCharacteristic->setValue(
             message.c_str()
@@ -783,12 +572,196 @@ void readSensorsAndTransmit() {
         Serial.print("BLE sent: ");
         Serial.println(message);
     }
+}
+
+
+// =====================================================
+// VIBRATION CAPTURE (LSM303D FIFO)
+// =====================================================
+
+// Records VIB_WINDOW_SAMPLES readings into vibBuffer using the sensor's 32-sample
+// FIFO, so readings keep their exact 1600 Hz spacing even if the ESP32 is briefly
+// busy. Also measures the sensor's real output rate (it can be a few % off).
+bool captureWindow(uint32_t* firstSampleMs, float* measuredRateHz) {
+
+    // Reset the FIFO: bypass clears it, stream mode starts collecting.
+    if (!writeRegister(LSM303D_ADDRESS, LSM303D_FIFO_CTRL, 0x00) ||
+        !writeRegister(LSM303D_ADDRESS, LSM303D_CTRL0, 0x40) ||       // FIFO_EN
+        !writeRegister(LSM303D_ADDRESS, LSM303D_FIFO_CTRL, 0x40)) {   // stream mode
+        return false;
+    }
+
+    *firstSampleMs = millis();
+    uint32_t startUs = micros();
+    uint32_t timeoutUs = (uint32_t)(2.0f * VIB_WINDOW_SAMPLES / VIB_NOMINAL_RATE_HZ * 1e6f);
+
+    uint16_t collected = 0;
+    bool ok = true;
+
+    while (collected < VIB_WINDOW_SAMPLES) {
+
+        uint8_t src = readRegister(LSM303D_ADDRESS, LSM303D_FIFO_SRC);
+
+        if (src & 0x40) {
+            Serial.println("Vibration capture: FIFO overrun (readings lost)");
+            ok = false;
+            break;
+        }
+
+        uint8_t available = src & 0x1F;
+
+        if (available == 0 && !(src & 0x20)) {
+            available = 32;  // not empty with a count of 0 means completely full
+        }
+
+        for (uint8_t i = 0; i < available && collected < VIB_WINDOW_SAMPLES; i++) {
+
+            uint8_t b[6];
+
+            if (!readRegisters(LSM303D_ADDRESS, LSM303D_OUT_X_L, b, 6)) {
+                Serial.println("Vibration capture: I2C read failed");
+                ok = false;
+                break;
+            }
+
+            vibBuffer[collected][0] = (int16_t)((b[1] << 8) | b[0]);
+            vibBuffer[collected][1] = (int16_t)((b[3] << 8) | b[2]);
+            vibBuffer[collected][2] = (int16_t)((b[5] << 8) | b[4]);
+            collected++;
+        }
+
+        if (!ok) {
+            break;
+        }
+
+        if (micros() - startUs > timeoutUs) {
+            Serial.println("Vibration capture: timed out");
+            ok = false;
+            break;
+        }
+    }
+
+    // Readings still waiting in the FIFO were also produced during this time.
+    uint8_t pending = readRegister(LSM303D_ADDRESS, LSM303D_FIFO_SRC) & 0x1F;
+    uint32_t elapsedUs = micros() - startUs;
+
+    // Back to bypass so the 500 ms status readings see the latest value.
+    writeRegister(LSM303D_ADDRESS, LSM303D_FIFO_CTRL, 0x00);
+    writeRegister(LSM303D_ADDRESS, LSM303D_CTRL0, 0x00);
+
+    if (!ok) {
+        return false;
+    }
+
+    float rate = (collected + pending) / (elapsedUs / 1e6f);
+
+    if (rate < 0.9f * VIB_NOMINAL_RATE_HZ || rate > 1.1f * VIB_NOMINAL_RATE_HZ) {
+
+        Serial.print("Vibration capture: measured rate ");
+        Serial.print(rate, 1);
+        Serial.println(" Hz looks wrong; using nominal");
+
+        rate = VIB_NOMINAL_RATE_HZ;
+    }
+
+    *measuredRateHz = rate;
+
+    return true;
+}
+
+
+// =====================================================
+// VIBRATION TRANSMISSION
+// =====================================================
+
+bool vibrationReady() {
+
+    if (!accelerometerInitialized || !deviceConnected ||
+        vibCccd == nullptr || !vibCccd->getNotifications()) {
+        return false;  // no sensor, or the receiver hasn't subscribed
+    }
+
+    uint16_t mtu = bleServer->getPeerMTU(bleServer->getConnId());
+
+    if (mtu < smolbugs::MIN_MTU) {
+
+        // A smaller MTU would silently truncate frames, so don't send at all.
+        Serial.print("Vibration skipped: MTU ");
+        Serial.print(mtu);
+        Serial.print(" < ");
+        Serial.println(smolbugs::MIN_MTU);
+
+        return false;
+    }
+
+    return true;
+}
+
+
+void sendVibrationWindow() {
+
+    uint32_t firstSampleMs = 0;
+    float rateHz = VIB_NOMINAL_RATE_HZ;
+
+    if (!captureWindow(&firstSampleMs, &rateHz)) {
+        vibCaptureFailures++;
+        return;
+    }
+
+    uint8_t frame[smolbugs::MAX_DATA_FRAME_SIZE];
+
+    unsigned long started = millis();
+    uint32_t errorsBefore = vibNotifyErrors;
+
+    size_t len = smolbugs::encodeStart(
+        frame,
+        vibWindowId,
+        rateHz,
+        VIB_WINDOW_SAMPLES,
+        smolbugs::SAMPLES_PER_CHUNK,
+        VIB_RANGE_G,
+        VIB_LSB_PER_G,
+        firstSampleMs
+    );
+
+    vibCharacteristic->setValue(frame, len);
+    vibCharacteristic->notify();
+    delay(VIB_FRAME_GAP_MS);
+
+    uint16_t chunks = smolbugs::chunkCount(
+        VIB_WINDOW_SAMPLES,
+        smolbugs::SAMPLES_PER_CHUNK
+    );
+
+    for (uint16_t c = 0; c < chunks && deviceConnected; c++) {
+
+        uint32_t offset = (uint32_t)c * smolbugs::SAMPLES_PER_CHUNK;
+        uint32_t remaining = VIB_WINDOW_SAMPLES - offset;
+        size_t count = remaining < smolbugs::SAMPLES_PER_CHUNK
+            ? remaining
+            : smolbugs::SAMPLES_PER_CHUNK;
+
+        len = smolbugs::encodeData(
+            frame,
+            vibWindowId,
+            c,
+            &vibBuffer[offset],
+            count
+        );
+
+        vibCharacteristic->setValue(frame, len);
+        vibCharacteristic->notify();
+
+        delay(VIB_FRAME_GAP_MS);
+    }
 
     vibWindowsSent++;
 
     Serial.print("Vibration window ");
     Serial.print(vibWindowId);
-    Serial.print(" sent in ");
+    Serial.print(": ");
+    Serial.print(rateHz, 1);
+    Serial.print(" Hz, sent in ");
     Serial.print(millis() - started);
     Serial.print(" ms, notify errors: ");
     Serial.println(vibNotifyErrors - errorsBefore);
@@ -808,13 +781,11 @@ void setup() {
     delay(1000);
 
     Serial.println();
-    Serial.println("MachineGuard Thermistor + BLE");
+    Serial.println("MachineGuard Thermistor + Accelerometer");
     Serial.println("--------------------------------");
 
 
-    // -------------------------------------------------
-    // INITIALIZE OLED
-    // -------------------------------------------------
+    // Initialize OLED.
 
     VextON();
 
@@ -827,9 +798,7 @@ void setup() {
     display.setFont(ArialMT_Plain_10);
 
 
-    // -------------------------------------------------
-    // INITIALIZE ADC
-    // -------------------------------------------------
+    // Initialize ADC.
 
     analogReadResolution(12);
 
@@ -839,46 +808,49 @@ void setup() {
     );
 
 
-    // -------------------------------------------------
-    // INITIALIZE IMU I2C
-    // -------------------------------------------------
+    // Initialize accelerometer I2C.
 
-    Wire.begin(
+    IMU_WIRE.begin(
         IMU_SDA,
         IMU_SCL,
-        IMU_I2C_FREQUENCY
+        400000
     );
 
-    Serial.println("IMU I2C initialized");
+    scanIMUBus();
 
-    imuInitialized = initializeIMU();
+    accelerometerInitialized = initializeAccelerometer();
 
 
-    // -------------------------------------------------
-    // INITIALIZE BLE
-    // -------------------------------------------------
+    // Initialize BLE.
 
     initializeBLE();
 
 
-    // -------------------------------------------------
-    // INITIAL DISPLAY
-    // -------------------------------------------------
+    // Initial OLED screen.
 
     display.drawString(0, 0, "MachineGuard");
 
-    display.drawString(0, 16, "Thermistor + BLE");
+    display.drawString(0, 16, "Thermistor + IMU");
 
     display.drawString(
         0,
         32,
-        imuInitialized ? "IMU: Ready" : "IMU: ERROR"
+        accelerometerInitialized
+            ? "Accelerometer: Ready"
+            : "Accelerometer: ERROR"
     );
 
     display.display();
 
 
     Serial.println("Thermistor initialized");
+
+    Serial.println(
+        accelerometerInitialized
+            ? "Accelerometer initialized"
+            : "Accelerometer initialization failed"
+    );
+
     Serial.println("System ready");
 }
 
@@ -893,7 +865,7 @@ void loop() {
 
         lastSensorUpdate = millis();
 
-        readSensorsAndTransmit();
+        readSensors();
     }
 
     if (millis() - lastVibWindow >= VIB_INTERVAL_MS) {
