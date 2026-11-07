@@ -1,9 +1,10 @@
 """Converts the thermistor's divider voltage (voltage_mv in the current packets) to °C.
 
-Uses the Beta equation for an NTC thermistor. The defaults assume a common setup:
-10 kΩ NTC (Beta 3950) and a 10 kΩ fixed resistor on 3.3 V, with the NTC between
-the ADC pin and ground. CONFIRM THESE AGAINST YOUR CIRCUIT AND THERMISTOR DATASHEET;
-a wrong Beta or wrong divider side gives a plausible-looking but wrong temperature.
+Uses the Beta equation for an NTC thermistor.
+
+Circuit (from machine1.ino): 3.3 V -> 75 kΩ fixed resistor -> ADC pin -> NTC -> GND.
+The NTC itself (100 kΩ, Beta 3950) is an ASSUMPTION until checked against the part's
+datasheet: a wrong value still gives a plausible-looking but wrong temperature.
 """
 
 from __future__ import annotations
@@ -18,10 +19,10 @@ KELVIN = 273.15
 @dataclass(frozen=True)
 class ThermistorConfig:
     supply_mv: float = 3300.0
-    fixed_resistor_ohm: float = 10_000.0
-    r0_ohm: float = 10_000.0  # NTC resistance at t0_c
+    fixed_resistor_ohm: float = 75_000.0  # confirmed in machine1.ino
+    r0_ohm: float = 100_000.0  # UNVERIFIED: NTC resistance at t0_c
     t0_c: float = 25.0
-    beta: float = 3950.0
+    beta: float = 3950.0  # UNVERIFIED
     ntc_on_low_side: bool = True  # NTC between ADC pin and GND
 
     def __post_init__(self) -> None:
@@ -56,3 +57,17 @@ def temperatures_from_packet(packet: dict[str, Any], cfg: ThermistorConfig = The
         except (TypeError, ValueError):
             out[str(sensor.get("id"))] = None
     return out
+
+
+def parse_thermistor_message(text: str, cfg: ThermistorConfig = ThermistorConfig()) -> dict[str, Any]:
+    """Parse the machine1 BLE text message 'sequence,voltage_mV,resistance_ohms'."""
+    parts = text.strip().split(",")
+    if len(parts) != 3:
+        raise ValueError(f"expected 'sequence,voltage_mV,resistance_ohms', got {text!r}")
+    sequence, voltage_mv, resistance = int(parts[0]), int(parts[1]), int(parts[2])
+    try:
+        temperature = voltage_to_celsius(voltage_mv, cfg)
+    except ValueError:
+        temperature = None
+    return {"sequence": sequence, "voltage_mv": voltage_mv, "resistance_ohm": resistance,
+            "temperature_c": temperature}

@@ -5,11 +5,11 @@ SmolBugs is a predictive-maintenance system that listens to industrial machines 
 This folder holds the **processing stage**: it takes raw vibration readings and works out *which frequencies* the machine is vibrating at, and how strongly, and converts the thermistor reading to a temperature. Everything later in the system (anomaly detection, maintenance recommendations, the dashboard) is built on top of this.
 
 ```
-ESP32 sensor  →  MQTT  →  [ reassemble chunks → FFT analysis ]  →  ML anomaly detection  →  dashboard
-                            ▲ you are here
+ESP32 (machine1)  →  Bluetooth  →  [ receiver → reassemble → FFT analysis ]  →  ML anomaly detection  →  dashboard
+                                     ▲ you are here
 ```
 
-**Current status:** the accelerometer (ADXL355) hasn't arrived yet, so the vibration side runs on simulated packets for now. The thermistor is connected and its readings can be converted today.
+**Current status:** the accelerometer (ADXL355) hasn't arrived yet, so the firmware sends a generated test vibration signal over Bluetooth instead. Everything else runs for real: the thermistor readings, the Bluetooth link, decoding, and FFT analysis.
 
 ## Why an FFT?
 
@@ -35,15 +35,19 @@ predictive-maintenance/
 ├── processing/
 │   ├── fft.py              FFT, power spectrum, peaks, harmonics, band energy
 │   ├── config.py           Settings (sample rate, window size, frequency bands)
-│   ├── assembler.py        Rebuilds full windows from chunked MQTT packets
+│   ├── ble_protocol.py     Decodes the binary Bluetooth vibration messages
+│   ├── assembler.py        Rebuilds full windows from chunks
 │   ├── analysis.py         Runs a full window through the FFT, returns results
 │   ├── temperature.py      Thermistor voltage → °C
 │   └── __init__.py         Lets you `from processing import ...`
+├── ingest/
+│   └── ble_receiver.py     Connects to the board over Bluetooth, runs everything
 ├── simulation/
 │   ├── synthetic.py        Fake vibration signals with known answers
-│   ├── packet_simulator.py Fake ESP32 packets in the chunked format
+│   ├── packet_simulator.py Fake healthy/faulty machine windows
+│   ├── fake_ble_board.py   Pretend Bluetooth board, for running without hardware
 │   └── fft_demo.py         Interactive demo: healthy vs faulty machine
-├── tests/                  69 automated tests
+├── tests/                  108 automated tests
 └── pytest.ini          Test configuration
 ```
 
@@ -59,7 +63,7 @@ E:\SmolBugs\.venv\Scripts\Activate.ps1
 #    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 # 2. Install dependencies (first time only)
-python -m pip install numpy scipy plotly pytest
+python -m pip install numpy scipy plotly pytest bleak
 ```
 
 If the `.venv` folder doesn't exist yet, create it from `E:\SmolBugs` with `python -m venv .venv`.
@@ -70,7 +74,7 @@ If the `.venv` folder doesn't exist yet, create it from `E:\SmolBugs` with `pyth
 python -m pytest -q
 ```
 
-Expected result: `69 passed`.
+Expected result: `101 passed, 7 skipped` on Windows. The 7 skipped tests compile the ESP32 firmware on the PC and only run where a C++ compiler (`g++`) is installed; with one, all 108 run.
 
 The FFT tests feed in signals where the right answer is already known (for example, "a 0.5 g vibration at exactly 123.37 Hz") and check that the FFT gets it back. They confirm that frequencies come out within 0.01 Hz and amplitudes within 0.5%.
 
@@ -107,94 +111,83 @@ The terminal also prints the numbers behind the charts, for example:
 
 Those match the values the simulation put in, which is how we know the processing is accurate.
 
-## Packet format for vibration data
+## Running the receiver
 
-The FFT needs 4,096 readings taken at a steady 4,000 per second. Sending one MQTT message per reading isn't workable, so the ESP32 buffers readings (timed by the sensor's own clock) and sends each window as 8 chunks of 512 samples:
-
-```json
-{
-  "machine_id": "MG-001",
-  "window_id": 1234,
-  "chunk": 0,
-  "chunks": 8,
-  "sample_rate_hz": 4000,
-  "range_g": 2,
-  "first_sample_ms": 96847,
-  "units": "g",
-  "x": [512 values],
-  "y": [512 values],
-  "z": [512 values]
-}
-```
-
-- `window_id` increases by one per window; `chunk` runs from 0 to `chunks - 1`.
-- `units` can be `"g"` or `"counts"` (raw ADXL355 values, converted using `range_g`).
-- Each chunk is about 15 KB as JSON.
-
-The current single-reading packets (`x_g`, `y_g`, `z_g`) are rejected by the assembler on purpose: they can't produce a spectrum.
-
-## Reassembling and analysing windows
-
-`WindowAssembler` collects chunks and returns a complete window once the last one arrives. It copes with chunks arriving out of order, several machines sending at once, and duplicate chunks. Windows missing a chunk for more than 5 seconds are dropped.
-
-```python
-from processing import WindowAssembler, analyze_window, PacketError
-
-assembler = WindowAssembler()
-
-def on_vibration_packet(packet: dict):          # call this from the MQTT subscriber
-    try:
-        window = assembler.add(packet)
-    except PacketError as err:
-        print(f"bad packet: {err}")
-        return
-    if window is not None:                       # all chunks arrived
-        result = analyze_window(window, rpm=3000)
-        x = result["axes"]["x"]
-        print(x["dominant_freq_hz"], x["velocity_rms_mm_s"], result["warnings"])
-```
-
-`analyze_window` returns, for each axis: dominant frequency and amplitude, velocity RMS, energy per frequency band, and (if `rpm` is given) the 1×/2×/3× harmonics. It also flags problems in `warnings`, such as a window of the wrong length or readings hitting the sensor's limit.
-
-### Try it without hardware
+The receiver connects to the board (Bluetooth name `MachineGuard`), prints every temperature reading and every vibration window's FFT results as they arrive, and can save everything to a folder.
 
 ```powershell
-python -m simulation.packet_simulator
+python -m ingest.ble_receiver                          # real board
+python -m ingest.ble_receiver --rpm 3000               # also show 1x/2x/3x harmonics
+python -m ingest.ble_receiver --out data/session1      # save readings and raw windows
+python -m ingest.ble_receiver --simulate               # fake board, no hardware needed
 ```
 
-This simulates four machines (healthy, imbalance, misalignment, bearing damage), splits each into packets, shuffles them to mimic network delivery, then reassembles and analyses them:
+Example output:
 
 ```
-window 0 (healthy     ) 1x=0.050 g  2x=0.010 g  500-1000 Hz=2.3e-05 g²  velocity=1.12 mm/s
-window 3 (bearing     ) 1x=0.050 g  2x=0.010 g  500-1000 Hz=1.6e-02 g²  velocity=1.21 mm/s
-window 2 (misalignment) 1x=0.080 g  2x=0.150 g  500-1000 Hz=2.4e-05 g²  velocity=2.43 mm/s
-window 1 (imbalance   ) 1x=0.300 g  2x=0.020 g  500-1000 Hz=2.5e-05 g²  velocity=6.65 mm/s
+Connected. MTU: 247
+Temp  #   12 | 1582 mV |   69.06 kΩ |  33.57 °C
+Vib   window     0 | dominant   50.00 Hz @ 0.050 g | velocity 1.12 mm/s | 1x=0.050 2x=0.010 3x=0.001
 ```
 
-Each fault stands out in a different number: imbalance in 1×, misalignment in 2×, and bearing damage in the 500–1000 Hz band. Bearing damage barely changes the overall velocity, which is why the frequency breakdown matters.
+With `--out`, the folder gets `temperature.jsonl` and `vibration.jsonl` (one result per line) and a `windows/` folder of raw data (`.npz`), which will become training data for anomaly detection. Press Ctrl+C to stop; a summary of anything lost or rejected is printed at the end.
+
+## How vibration travels over Bluetooth
+
+The FFT needs 4,096 readings taken at a steady 4,000 per second, which is about 24 KB of data. Streaming that continuously is more than a Bluetooth link to a laptop can reliably carry, so the board works in **capture-then-send** cycles:
+
+1. Record one window (4,096 readings, about 1 second) into memory.
+2. Send it as 1 START message followed by 128 DATA messages of 32 readings each (about 1.3 seconds).
+3. Wait, then repeat every 10 seconds.
+
+Messages are raw bytes rather than text, which is three to four times more compact:
+
+```
+START (17 bytes, once per window):
+  type=1 | window_id | sample rate | number of readings | readings per message | range | scale | start time
+
+DATA (197 bytes):
+  type=2 | window_id | message number (0–127) | 32 × (x, y, z) as 2-byte integers
+```
+
+Each reading is stored as a whole number of 1/16,000 g (62.5 µg), far finer than machinery vibration needs. The full byte layout is documented at the top of `processing/ble_protocol.py` and in `smolbugs_protocol.h` in the firmware folder. Tests check that both sides produce identical bytes.
+
+**Bluetooth MTU:** one 197-byte message needs the link's MTU (maximum message size) to be at least 200. The default is only 23, so the board requests 247 and Windows normally agrees. The receiver prints the MTU when it connects. If it's too small, the board skips vibration rather than sending cut-off messages, and the receiver prints a warning.
+
+**Lost messages:** if a message goes missing, that window is dropped after 10 seconds and the next window arrives normally. The summary at the end shows how many were lost. If it's more than a few, increase `VIB_FRAME_GAP_MS` in the firmware.
+
+## Firmware (machine1)
+
+`hardware scripts/machine1/machine1/` contains `machine1.ino` and `smolbugs_protocol.h`, which must stay in the same folder. On top of the existing thermistor, OLED and Bluetooth code, it adds:
+
+- A second Bluetooth characteristic (`6E400004-…`) for vibration. Temperature keeps its original one (`6E400003-…`) and message format.
+- Capture-then-send, every `VIB_INTERVAL_MS` (10 s), only while a receiver is subscribed.
+- `USE_TEST_SIGNAL 1`: generates a 3,000 RPM machine signal (0.05 g at 50 Hz, 0.01 g at 100 Hz, noise, 1 g gravity on z) until the ADXL355 arrives. When it does, set this to `0` and fill in `captureWindow()`.
+- The window count on the OLED, and send time and error counts on the serial monitor.
+
+Settings near the top of the sketch:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `VIB_INTERVAL_MS` | 10000 | Time between windows |
+| `VIB_FRAME_GAP_MS` | 10 | Pause between messages; lower is faster but risks drops |
+| `VIB_SAMPLE_RATE_HZ` | 4000 | Replace with the sensor's measured rate once it's fitted |
+| `VIB_RANGE_G` | 2 | Accelerometer range (2, 4 or 8 g) |
 
 ## Temperature
 
-The thermistor packets already coming in report a divider voltage. `temperatures_from_packet` converts every thermistor in a packet to °C:
+The board sends `sequence,voltage_mV,resistance_ohms` twice a second. The receiver converts the voltage to °C with the Beta equation for an NTC thermistor.
+
+The circuit is 3.3 V → 75 kΩ fixed resistor → ADC pin (GPIO1) → thermistor → ground, taken from `machine1.ino`. **The thermistor's own values are still assumptions:** 100 kΩ at 25 °C with Beta 3950. A 10 kΩ part can't explain the ~69 kΩ being measured at room temperature, but the exact part should be confirmed from its datasheet. Change the values with `ThermistorConfig`:
 
 ```python
-from processing import temperatures_from_packet
+from processing import ThermistorConfig, parse_thermistor_message
 
-temperatures_from_packet(packet)   # {"sensor_0": 26.87}
+cfg = ThermistorConfig(r0_ohm=100_000, beta=4250)
+parse_thermistor_message("12,1582,69062", cfg)   # {'sequence': 12, ..., 'temperature_c': ...}
 ```
 
-A reading of 0 mV or the full supply voltage means a wiring fault (short or open circuit) and comes back as `None`.
-
-**The defaults are assumptions and must be checked against the real circuit:** 10 kΩ NTC thermistor with Beta 3950, a 10 kΩ fixed resistor, 3.3 V supply, thermistor between the ADC pin and ground. Change them with `ThermistorConfig`:
-
-```python
-from processing import ThermistorConfig, temperatures_from_packet
-
-cfg = ThermistorConfig(beta=3435, ntc_on_low_side=False)
-temperatures_from_packet(packet, cfg)
-```
-
-A wrong Beta value or divider orientation still gives a believable-looking temperature, so it's worth verifying once against a reference thermometer.
+A wrong Beta value still gives a believable-looking temperature, so it's worth checking once against a regular thermometer.
 
 ## Using it in code
 
@@ -271,6 +264,7 @@ All in `FFTConfig` (`processing/config.py`):
 ## Known limitations and next steps
 
 - **Frequency bands are generic placeholders.** The 50 Hz band edge lands exactly on the 1× peak of a 3,000 RPM motor, splitting its energy across two bands (visible in the example output above). Bands should be tuned per machine once the real RPMs of the band saw and drill are measured, so each harmonic sits inside a single band.
-- **Vibration is tested on simulated data only.** Once the ADXL355 arrives: update the ESP32 firmware to send chunked packets, connect `WindowAssembler` to the MQTT subscriber, and record healthy baselines from each machine.
-- **Thermistor settings are assumed** until checked against the circuit and datasheet.
+- **Vibration uses a test signal until the ADXL355 arrives.** Then: write the sensor driver in `captureWindow()`, measure its real sample rate, and record healthy baselines from each machine.
+- **Firmware testing on the PC uses stand-ins for the Arduino and Bluetooth libraries.** The real check is uploading to the board and running the receiver.
+- **Thermistor values are assumed** until confirmed from the part's datasheet.
 - Feature extraction (RMS, kurtosis, crest factor), storage, and anomaly detection are planned but not part of this module yet.

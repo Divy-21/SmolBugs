@@ -14,7 +14,8 @@ from .fft import (
     velocity_rms_mm_s,
     welch_psd,
 )
-from .temperature import ThermistorConfig, temperatures_from_packet, voltage_to_celsius
+from .ble_protocol import BleVibrationDecoder, window_to_frames
+from .temperature import ThermistorConfig, parse_thermistor_message, temperatures_from_packet, voltage_to_celsius
 
 __all__ = [
     "FFTConfig",
@@ -35,4 +36,7 @@ __all__ = [
     "ThermistorConfig",
     "voltage_to_celsius",
     "temperatures_from_packet",
+    "parse_thermistor_message",
+    "BleVibrationDecoder",
+    "window_to_frames",
 ]
