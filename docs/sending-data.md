@@ -46,7 +46,10 @@ Each takes one packet or a JSON list of up to 100 (batching cuts HTTPS overhead)
 - `packet_id`: a unique ID for this reading (8–64 letters, digits, `_` or `-`). The gateway makes it in
   `predictive-maintenance/ingest/cloud.py`. If a packet with the same `packet_id` is already stored, the cloud
   skips it, so retrying a send is always safe. Packets without one are always stored. Windows take it too.
-- If you converted the thermistor to °C, add `"temperature_c": 31.2` to that sensor.
+- If you converted the thermistor to °C, add `"temperature_c": 31.2` to that sensor. `null` is fine: the cloud then
+  converts `voltage_mv` itself. Accelerometer (`x_g`, `y_g`, `z_g`), gyroscope and `valid` flags are accepted too.
+- Status packets are written within about 2 s. Each is checked against limits (temperature, shock, vibration
+  spread, dead sensor); 3 abnormal in a row open an alert and are written at once.
 - Extra fields are fine; they're stored too.
 
 ### Vibration window
@@ -91,7 +94,8 @@ Don't let a failed POST crash the receiver: wrap it in `try/except`, and keep re
 
 | Status | Meaning | Fix |
 |---|---|---|
-| `200 {"ok": true, "stored": 1, "duplicates": 0}` | Saved. `duplicates` counts packets skipped because their `packet_id` was already stored | — |
+| `200 {"ok": true, "stored": 1, "duplicates": 0}` | Saved (status: held, written within ~2 s). `duplicates` counts packets skipped because their `packet_id` was already stored. Status answers also carry `abnormal` and `flags` (limits each packet broke) | — |
+| `503` (status only) | An abnormal reading couldn't be written yet | Retry with the same `packet_id` (Xavion's sender does) |
 | `400` | Not valid JSON, or a field is wrong; `details` names the field | Fix that field |
 | `401` | Missing or wrong `x-device-key` | Check the header and the key |
 | `500` | Server problem | Tell Manraj |
@@ -101,5 +105,6 @@ Don't let a failed POST crash the receiver: wrap it in `try/except`, and keep re
 - `GET {CLOUD_URL}/api/v1/machines`: every machine with its latest packet and window
 - `GET {CLOUD_URL}/api/v1/machines/MG-001/readings?minutes=10`: recent history, oldest first
 - `GET {CLOUD_URL}/api/health`: `{"ok": true}` if the service is up
+- `GET {CLOUD_URL}/api/v1/status`: what the status endpoint is holding in memory right now
 
 No key needed for reading (for now).

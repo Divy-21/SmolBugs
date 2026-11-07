@@ -108,14 +108,16 @@ JSON
 SERVICE_ARN="arn:aws:ecs:$REGION:$ACCOUNT:service/default/$APP"
 if aws ecs describe-express-gateway-service --service-arn "$SERVICE_ARN" >/dev/null 2>&1; then
   say "Rolling out $TAG"
+  # Exactly one task: the status endpoint buffers packets in memory (lib/stream.ts).
   aws ecs update-express-gateway-service --service-arn "$SERVICE_ARN" --primary-container "$CONTAINER" \
+    --scaling-target minTaskCount=1,maxTaskCount=1 \
     --monitor-resources DEPLOYMENT --monitor-mode TEXT-ONLY
 else
   say "Creating Express Mode service $APP"
   aws ecs create-express-gateway-service --service-name "$APP" --cluster default \
     --execution-role-arn "$EXEC_ROLE" --infrastructure-role-arn "$INFRA_ROLE" \
     --health-check-path /api/health --cpu 512 --memory 1024 \
-    --scaling-target minTaskCount=1,maxTaskCount=2 \
+    --scaling-target minTaskCount=1,maxTaskCount=1 \
     --primary-container "$CONTAINER" \
     --monitor-resources DEPLOYMENT --monitor-mode TEXT-ONLY
 fi
