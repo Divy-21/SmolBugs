@@ -41,13 +41,14 @@ predictive-maintenance/
 │   ├── temperature.py      Thermistor voltage → °C
 │   └── __init__.py         Lets you `from processing import ...`
 ├── ingest/
-│   └── ble_receiver.py     Connects to the board over Bluetooth, runs everything
+│   ├── ble_receiver.py     Connects to the board over Bluetooth, runs everything
+│   └── fft_report.py       Interactive FFT report from a recorded session
 ├── simulation/
 │   ├── synthetic.py        Fake vibration signals with known answers
 │   ├── packet_simulator.py Fake healthy/faulty machine windows
 │   ├── fake_ble_board.py   Pretend Bluetooth board, for running without hardware
 │   └── fft_demo.py         Interactive demo: healthy vs faulty machine
-├── tests/                  108 automated tests
+├── tests/                  126 automated tests
 └── pytest.ini          Test configuration
 ```
 
@@ -74,7 +75,7 @@ If the `.venv` folder doesn't exist yet, create it from `E:\SmolBugs` with `pyth
 python -m pytest -q
 ```
 
-Expected result: `101 passed, 7 skipped` on Windows. The 7 skipped tests compile the ESP32 firmware on the PC and only run where a C++ compiler (`g++`) is installed; with one, all 108 run.
+Expected result: `119 passed, 7 skipped` on Windows. The 7 skipped tests compile the ESP32 firmware on the PC and only run where a C++ compiler (`g++`) is installed; with one, all 126 run.
 
 The FFT tests feed in signals where the right answer is already known (for example, "a 0.5 g vibration at exactly 123.37 Hz") and check that the FFT gets it back. They confirm that frequencies come out within 0.01 Hz and amplitudes within 0.5%.
 
@@ -132,6 +133,33 @@ Vib   window     0 | dominant   50.00 Hz @ 0.050 g | velocity 1.12 mm/s | 1x=0.0
 
 With `--out`, the folder gets `temperature.jsonl` and `vibration.jsonl` (one result per line) and a `windows/` folder of raw data (`.npz`), which will become training data for anomaly detection. Press Ctrl+C to stop; a summary of anything lost or rejected is printed at the end.
 
+## Viewing the FFT from the board
+
+Record with `--out`, then build an interactive report from what was saved:
+
+```powershell
+python -m ingest.ble_receiver --rpm 3000 --out data/session1      # Ctrl+C when done
+python -m ingest.fft_report data/session1 --rpm 3000
+start data/session1/fft_report.html
+```
+
+Or keep the report updating live while recording. Open it once and it reloads itself every 5 seconds:
+
+```powershell
+python -m ingest.ble_receiver --rpm 3000 --out data/session1 --live-html
+start data/session1/fft_report.html          # in a second terminal
+```
+
+The report shows the latest window (or `--window N` for a specific one):
+
+1. **Raw vibration:** the first 0.2 s of each axis, with gravity removed.
+2. **FFT amplitude spectrum:** with dotted 1×/2×/3× running-speed lines when `--rpm` is given.
+3. **Welch PSD:** the smoothed energy spectrum, on a log scale.
+4. **Velocity RMS per window:** how overall vibration changes across the session.
+5. **Temperature:** every reading in the session.
+
+Keep `plotly.min.js` next to `fft_report.html` in the session folder; the report needs it to draw the charts.
+
 ## How vibration travels over Bluetooth
 
 The FFT needs 4,096 readings taken at a steady 4,000 per second, which is about 24 KB of data. Streaming that continuously is more than a Bluetooth link to a laptop can reliably carry, so the board works in **capture-then-send** cycles:
@@ -186,6 +214,8 @@ from processing import ThermistorConfig, parse_thermistor_message
 cfg = ThermistorConfig(r0_ohm=100_000, beta=4250)
 parse_thermistor_message("12,1582,69062", cfg)   # {'sequence': 12, ..., 'temperature_c': ...}
 ```
+
+The receiver also understands the JSON status messages sent by earlier firmware (`{"machine_id": ..., "sensors": [...]}`, newline-terminated and split across Bluetooth messages), so temperature works with either firmware. Vibration needs the updated `machine1.ino`.
 
 A wrong Beta value still gives a believable-looking temperature, so it's worth checking once against a regular thermometer.
 
