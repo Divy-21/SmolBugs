@@ -34,12 +34,18 @@ model StatusPacket {
   id           Int      @id @default(autoincrement())
   machineId    String
   machine      Machine  @relation(fields: [machineId], references: [id])
-  receivedAt   DateTime @default(now()) // server clock; the ESP32 has none
+  receivedAt   DateTime @default(now()) // the gateway's received_at_utc; server clock if missing
+  packetId     String?  @unique // the gateway's packet_id: a retry isn't stored twice
   deviceTimeMs BigInt? // timestamp_ms: device uptime
   bootId       String?
   seq          Int?
   thermistorMv Int? // first thermistor's divider voltage
-  temperatureC Float? // only if the gateway already converted it
+  temperatureC Float? // the gateway's conversion, or the cloud's if it sent none
+  accelXG      Float? // accelerometer snapshot, in g
+  accelYG      Float?
+  accelZG      Float?
+  abnormal     Boolean  @default(false) // part of a confirmed abnormal run
+  flags        Json? // limits this packet broke, e.g. ["temp_high"]
   payload      Json
 
   @@index([machineId, receivedAt])
@@ -51,7 +57,10 @@ model VibrationWindow {
   id              Int      @id @default(autoincrement())
   machineId       String
   machine         Machine  @relation(fields: [machineId], references: [id])
-  receivedAt      DateTime @default(now())
+  receivedAt      DateTime @default(now()) // the gateway's received_at_utc
+  packetId        String?  @unique // the gateway's packet_id
+  bootId          String?
+  seq             Int?
   windowId        Int
   firstSampleMs   BigInt?
   sampleRateHz    Float
