@@ -35,6 +35,9 @@ model StatusPacket {
   machineId    String
   machine      Machine  @relation(fields: [machineId], references: [id])
   receivedAt   DateTime @default(now()) // server clock; the ESP32 has none
+  // Gateway's hash of machine|boot|kind|seq. Unique, so a retried upload isn't
+  // stored twice. Optional: packets without one are always stored.
+  packetId     String?  @unique
   deviceTimeMs BigInt? // timestamp_ms: device uptime
   bootId       String?
   seq          Int?
@@ -52,6 +55,8 @@ model VibrationWindow {
   machineId       String
   machine         Machine  @relation(fields: [machineId], references: [id])
   receivedAt      DateTime @default(now())
+  packetId        String?  @unique // see StatusPacket.packetId
+  bootId          String?
   windowId        Int
   firstSampleMs   BigInt?
   sampleRateHz    Float

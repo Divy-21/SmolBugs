@@ -3,6 +3,15 @@ import { z } from "zod";
 // The packet formats the cloud accepts. Fields the team adds later are kept
 // (loose objects) and stored in `payload`; only the fields below are checked.
 
+// The gateway's packet_id (hash of machine|boot|kind|seq, see
+// predictive-maintenance/ingest/cloud.py). Optional; when present it must be unique.
+const packetId = z
+  .string()
+  .min(8)
+  .max(64)
+  .regex(/^[A-Za-z0-9_-]+$/, "packet_id may use letters, digits, _ - only")
+  .optional();
+
 const machineId = z
   .string()
   .trim()
@@ -24,6 +33,7 @@ const sensor = z.looseObject({
 
 export const statusPacket = z.looseObject({
   machine_id: machineId,
+  packet_id: packetId,
   timestamp_ms: z.number().int().nonnegative().optional(),
   boot_id: z.string().max(64).optional(),
   seq: z.number().int().nonnegative().optional(),
@@ -54,6 +64,8 @@ const axis = z.looseObject({
 
 export const vibrationWindow = z.looseObject({
   machine_id: machineId,
+  packet_id: packetId,
+  boot_id: z.string().max(64).optional(),
   window_id: z.number().int().nonnegative(),
   first_sample_ms: z.number().int().nonnegative().nullable().optional(),
   sample_rate_hz: z.number().positive(),

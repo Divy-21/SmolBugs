@@ -42,6 +42,9 @@ array of up to 100. Extra fields are allowed and kept: every row stores the pack
 | `GET /api/v1/machines/{id}/readings?minutes=10` | Status packets and windows from the last N minutes, oldest first |
 | `GET /api/health` | `{"ok": true}`, for the load balancer; doesn't touch the database |
 
+Packets carrying a `packet_id` already in the database are skipped (unique index, `ON CONFLICT DO NOTHING`)
+and counted in the response's `duplicates`, so the gateway can retry safely.
+
 Machines are created automatically the first time a packet names them. Field-by-field formats are in
 `src/lib/packets.ts`.
 

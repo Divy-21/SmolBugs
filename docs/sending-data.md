@@ -43,6 +43,9 @@ Each takes one packet or a JSON list of up to 100 (batching cuts HTTPS overhead)
 
 - Required: `machine_id` (letters, digits, `_ . -`) and `sensors` (a list, may be empty).
 - Optional but useful: `timestamp_ms` (device uptime), `boot_id` (random per power-up), `seq` (counts up).
+- `packet_id`: a unique ID for this reading (8–64 letters, digits, `_` or `-`). The gateway makes it in
+  `predictive-maintenance/ingest/cloud.py`. If a packet with the same `packet_id` is already stored, the cloud
+  skips it, so retrying a send is always safe. Packets without one are always stored. Windows take it too.
 - If you converted the thermistor to °C, add `"temperature_c": 31.2` to that sensor.
 - Extra fields are fine; they're stored too.
 
@@ -88,7 +91,7 @@ Don't let a failed POST crash the receiver: wrap it in `try/except`, and keep re
 
 | Status | Meaning | Fix |
 |---|---|---|
-| `200 {"ok": true, "stored": 1}` | Saved | — |
+| `200 {"ok": true, "stored": 1, "duplicates": 0}` | Saved. `duplicates` counts packets skipped because their `packet_id` was already stored | — |
 | `400` | Not valid JSON, or a field is wrong; `details` names the field | Fix that field |
 | `401` | Missing or wrong `x-device-key` | Check the header and the key |
 | `500` | Server problem | Tell Manraj |
