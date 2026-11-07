@@ -1,5 +1,7 @@
-"""SmolBugs signal processing: calibrated amplitude spectrum, Welch PSD, band power and harmonic analysis."""
+"""SmolBugs signal processing: FFT, chunk reassembly, window analysis and temperature."""
 
+from .analysis import analyze_axis, analyze_window
+from .assembler import AssembledWindow, PacketError, WindowAssembler
 from .config import FFTConfig
 from .fft import (
     Spectrum,
@@ -12,6 +14,7 @@ from .fft import (
     velocity_rms_mm_s,
     welch_psd,
 )
+from .temperature import ThermistorConfig, temperatures_from_packet, voltage_to_celsius
 
 __all__ = [
     "FFTConfig",
@@ -24,4 +27,12 @@ __all__ = [
     "rpm_to_hz",
     "velocity_rms_mm_s",
     "welch_psd",
+    "WindowAssembler",
+    "AssembledWindow",
+    "PacketError",
+    "analyze_window",
+    "analyze_axis",
+    "ThermistorConfig",
+    "voltage_to_celsius",
+    "temperatures_from_packet",
 ]
