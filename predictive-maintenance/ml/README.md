@@ -72,3 +72,27 @@ Every session is compared to its own `normal_free` runs, the same way the device
 ## Testing honestly
 
 Sessions are separate sensor mountings. `train.py` always tests on a session it never trained on, never on a random split of windows, because windows from the same run look almost identical and would inflate the score.
+
+## Recommendations
+
+Every result from `detector.predict()` includes a `recommendation`, for example "Tighten the chuck and check that the bit is seated all the way in." for a loose bit.
+
+## Slow wear warning (bearings)
+
+`wear.py` has `WearTracker`. Faults like imbalance show up in one window, but wear creeps in over days, so it judges each hour of use instead:
+
+1. Learn normal from the first hours of use (isolation forest).
+2. Each later hour: what share of windows look unusual, smoothed over 6 hours.
+3. Over 50% for 3 hours in a row: "Bearing wear likely: schedule service or replace the bearing soon."
+4. Temperature 15 °C above its normal rise, or vibration 3 times normal: "Critical: stop the machine now."
+
+It is checked on the real Ball Bearing Run-to-Failure dataset (Kaggle, Jung et al. 2023), cut down to 1000 Hz so it matches what our MPU-6050 can see:
+
+```powershell
+python -m ml.bearing_validation extract --zip "C:/Users/rimsh/Downloads/archive.zip"
+python -m ml.bearing_validation analyze
+```
+
+Result: learned normal from hours 0 to 24, sustained wear warning at hour 49, critical at hour 121, failure at hour 128. The chart is saved to `reports/bearing_wear_warning.png`.
+
+What drove the early warning was the bearing running hotter than normal, not vibration. At 1000 Hz the vibration only clearly changes in the last few hours, which is why the thermistor matters.

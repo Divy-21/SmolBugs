@@ -22,6 +22,16 @@ import pandas as pd
 from .features import AXES, estimate_run_hz, make_baseline, relative_features, window_features
 from .settings import DRILL_FFT, FAULT_LABELS, FS, NORMAL_LABELS
 
+RECOMMEND = {
+    "ok": "No action needed.",
+    "off": "No action needed.",
+    "imbalance": "Stop and check the chuck and bit for anything stuck to them or mounted off-centre.",
+    "bent_bit": "Replace the bit. If a new bit still wobbles, have the chuck checked.",
+    "loose_bit": "Tighten the chuck and check that the bit is seated all the way in.",
+    "overheat": "Let the drill cool down, clean the air vents, and use lighter pressure.",
+    "check": "Stop and inspect the drill. If nothing looks wrong, run it again so it can relearn normal.",
+}
+
 FRIENDLY = {
     "imbalance": "Imbalance: something on the chuck or bit is off-centre",
     "bent_bit": "Bent or crooked bit (misalignment)",
@@ -84,7 +94,8 @@ class MachineGuardDetector:
 
         # Main axis under a quarter of its normal level: the drill is switched off
         if row[f"{self.main_axis}_rms_rel"] < -2.0:
-            return {"status": "off", "label": "off", "message": "Machine off", "shutoff": False}
+            return {"status": "off", "label": "off", "message": "Machine off",
+                    "recommendation": RECOMMEND["off"], "shutoff": False}
 
         anomaly_score = float(self.iforest.decision_function(rel)[0])  # below 0 = unusual
         is_anomaly = anomaly_score < 0
@@ -108,5 +119,6 @@ class MachineGuardDetector:
             "anomaly_score": round(anomaly_score, 4),
             "rule_label": rule,
             "message": message,
+            "recommendation": RECOMMEND[label] if status == "fault" else RECOMMEND[status],
             "shutoff": status == "fault",
         }
