@@ -17,6 +17,33 @@ ESP32 --BLE or Wi-Fi--> laptop gateway --HTTPS--> SmolBugs cloud (AWS) --> datab
 | **Key** | Send it in the header `x-device-key`. Manraj DMs it; never commit it or post it in the channel. Locally: `dev-key-change-me` |
 | **AWS account?** | Not needed. The URL and the key are enough |
 
+## Run the board → cloud (PowerShell, on the laptop next to the board)
+
+Set the two values once per terminal:
+
+```powershell
+$env:CLOUD_URL = "https://sm-db6bb08ece0d477c9e820f118f7e670c.ecs.ca-central-1.on.aws"
+$env:DEVICE_KEY = "<the key Manraj DMed>"
+```
+
+Then run **one** of these:
+
+| Script | Use it when | Command |
+|---|---|---|
+| Xavion's receiver (recommended) | Any firmware: JSON or CSV temperature **and** vibration windows (FFT) | `cd predictive-maintenance` then `python -m ingest.ble_receiver --cloud --out data/session1` |
+| Kelvin's receiver | The board sends newline-terminated JSON status packets; temperature and accel snapshot only | `python "hardware scripts/machine1/receiver.py"` |
+
+How to tell it's working:
+- Xavion's prints `Cloud upload: https://…on.aws` at the start; Kelvin's prints `Cloud upload ON: https://…on.aws`.
+  **If the address isn't the `.on.aws` one, it's going to the wrong place.** Kelvin's prints `Cloud upload OFF`
+  if either value is missing.
+- Every few seconds: `cloud: sent N | waiting 0 | … | rejected (400) 0`. `sent` going up and `waiting` near 0 =
+  data is arriving. `rejected` above 0 = a format problem (the line before it names the field).
+- Check from any browser: `{CLOUD_URL}/api/v1/machines` shows the machine with a fresh `lastSeenAt`.
+
+An all-zero accelerometer reading is treated as a dead sensor: three in a row open an alert. That's expected until
+the accelerometer is wired.
+
 ## The two endpoints you send to
 
 | Send | To | When |
