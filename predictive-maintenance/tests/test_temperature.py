@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from processing import ThermistorConfig, temperatures_from_packet, voltage_to_celsius
+from processing import ThermistorConfig, parse_thermistor_message, temperatures_from_packet, voltage_to_celsius
 from processing.temperature import thermistor_resistance
 
 CFG = ThermistorConfig()
@@ -14,12 +14,16 @@ def _voltage_for_resistance(r, cfg=CFG):
     return cfg.supply_mv * cfg.fixed_resistor_ohm / (r + cfg.fixed_resistor_ohm)
 
 
-def test_midpoint_is_25c():
-    assert voltage_to_celsius(1650.0) == pytest.approx(25.0, abs=1e-9)
+def test_defaults_match_machine1_circuit():
+    assert CFG.fixed_resistor_ohm == 75_000 and CFG.supply_mv == 3300 and CFG.ntc_on_low_side
+
+
+def test_r0_resistance_is_25c():
+    assert voltage_to_celsius(_voltage_for_resistance(CFG.r0_ohm)) == pytest.approx(25.0, abs=1e-9)
 
 
 def test_known_beta_point_zero_celsius():
-    r0c = 10_000 * math.exp(3950 * (1 / 273.15 - 1 / 298.15))  # ~33.6 kΩ
+    r0c = CFG.r0_ohm * math.exp(CFG.beta * (1 / 273.15 - 1 / 298.15))
     assert voltage_to_celsius(_voltage_for_resistance(r0c)) == pytest.approx(0.0, abs=1e-6)
 
 
@@ -35,8 +39,31 @@ def test_hotter_means_lower_voltage_on_low_side():
 
 
 def test_current_packet_reading():
-    # The real packet from MG-001: 1582 mV -> about 27 °C with default assumptions
-    assert voltage_to_celsius(1582.0) == pytest.approx(26.87, abs=0.05)
+    # Real reading from MG-001: 1582 mV -> ~69 kΩ -> ~33.6 °C if the NTC is 100 kΩ / B3950
+    assert thermistor_resistance(1582.0) == pytest.approx(69_064, rel=1e-3)
+    assert voltage_to_celsius(1582.0) == pytest.approx(33.57, abs=0.05)
+
+
+def test_resistance_matches_firmware_calculation():
+    # machine1.ino: R = 75000 * V / (3.3 - V)
+    v = 1.582
+    assert thermistor_resistance(1582.0) == pytest.approx(75000 * v / (3.3 - v), rel=1e-9)
+
+
+def test_parse_machine1_ble_message():
+    r = parse_thermistor_message("44,1582,69062")
+    assert (r["sequence"], r["voltage_mv"], r["resistance_ohm"]) == (44, 1582, 69062)
+    assert r["temperature_c"] == pytest.approx(33.57, abs=0.05)
+
+
+def test_parse_machine1_message_with_wiring_fault():
+    assert parse_thermistor_message("5,0,0")["temperature_c"] is None
+
+
+@pytest.mark.parametrize("bad", ["", "1,2", "a,b,c", "1,2,3,4"])
+def test_parse_machine1_message_rejects_garbage(bad):
+    with pytest.raises(ValueError):
+        parse_thermistor_message(bad)
 
 
 @pytest.mark.parametrize("mv", [0.0, 3300.0, -5.0, 4000.0])
@@ -57,7 +84,7 @@ def test_temperatures_from_current_packet_format():
         "received_at_utc": "2026-11-07T17:58:52.177715+00:00",
     }
     temps = temperatures_from_packet(packet)
-    assert temps["sensor_0"] == pytest.approx(26.87, abs=0.05)
+    assert temps["sensor_0"] == pytest.approx(33.57, abs=0.05)
     assert temps["sensor_2"] is None
     assert "sensor_1" not in temps
 
