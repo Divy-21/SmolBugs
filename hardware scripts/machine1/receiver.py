@@ -1,5 +1,8 @@
 
 import asyncio
+import json
+
+from datetime import datetime, timezone
 
 from bleak import BleakClient, BleakScanner
 
@@ -10,30 +13,44 @@ TX_CHARACTERISTIC_UUID = (
     "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 )
 
+# Holds incomplete JSON messages between BLE notifications.
+receive_buffer = bytearray()
+
 
 def notification_handler(sender, data):
 
-    try:
-        message = data.decode("utf-8")
+    global receive_buffer
 
-        # Expected format:
-        # sequence,voltage_mV,resistance_ohms
+    # Append the incoming BLE chunk.
+    receive_buffer.extend(data)
 
-        sequence, voltage_mv, resistance_ohms = (
-            message.split(",")
-        )
+    # Messages end with a newline.
+    while b"\n" in receive_buffer:
 
-        voltage_mv = int(voltage_mv)
-        resistance_ohms = int(resistance_ohms)
+        message, _, remainder = receive_buffer.partition(b"\n")
 
-        print(
-            f"Packet: {sequence:>5} | "
-            f"Voltage: {voltage_mv:>4} mV | "
-            f"Resistance: {resistance_ohms / 1000:>7.2f} kOhm"
-        )
+        receive_buffer = bytearray(remainder)
 
-    except (ValueError, UnicodeDecodeError):
-        print(f"Invalid packet received: {data!r}")
+        if not message:
+            continue
+
+        try:
+
+            # Reconstruct and parse JSON.
+            payload = json.loads(message.decode("utf-8"))
+
+            # Add laptop reception timestamp.
+            payload["received_at_utc"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+
+            print(json.dumps(payload, indent=2))
+
+            print("-" * 50)
+
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+
+            print(f"Invalid JSON received: {error}")
 
 
 async def main():
@@ -49,8 +66,6 @@ async def main():
 
         print("MachineGuard not found.")
 
-        print("Check that the Heltec is powered on and advertising.")
-
         return
 
     print(f"Found: {device.name} [{device.address}]")
@@ -61,14 +76,15 @@ async def main():
 
         print("Connected to MachineGuard.")
 
+        print(f"Negotiated MTU reported by Bleak: {client.mtu_size}")
+
         await client.start_notify(
             TX_CHARACTERISTIC_UUID,
             notification_handler
         )
 
         print()
-        print("Receiving thermistor measurements...")
-        print("--------------------------------------")
+        print("Receiving MachineGuard JSON telemetry...")
         print("Press Ctrl+C to disconnect.")
         print()
 
