@@ -60,7 +60,7 @@ def test_parse_machine1_message_with_wiring_fault():
     assert parse_thermistor_message("5,0,0")["temperature_c"] is None
 
 
-@pytest.mark.parametrize("bad", ["", "1,2", "a,b,c", "1,2,3,4"])
+@pytest.mark.parametrize("bad", ["", "1,2", "a,b,c", "1,2,3,4,5,6"])
 def test_parse_machine1_message_rejects_garbage(bad):
     with pytest.raises(ValueError):
         parse_thermistor_message(bad)
@@ -92,3 +92,22 @@ def test_temperatures_from_current_packet_format():
 def test_config_validation():
     with pytest.raises(ValueError):
         ThermistorConfig(beta=0)
+
+
+def test_parse_lsm303d_status_message():
+    r = parse_thermistor_message("24,1260,0.170,0.374,-0.795")
+    assert (r["sequence"], r["voltage_mv"]) == (24, 1260)
+    assert r["accel_g"] == [0.170, 0.374, -0.795]
+    assert r["resistance_ohm"] == pytest.approx(75_000 * 1260 / (3300 - 1260), rel=1e-9)
+    assert r["temperature_c"] == pytest.approx(voltage_to_celsius(1260), abs=1e-9)
+
+
+def test_parse_lsm303d_status_with_wiring_fault():
+    r = parse_thermistor_message("3,0,0.0,0.0,1.0")
+    assert r["temperature_c"] is None and r["resistance_ohm"] is None and r["accel_g"] == [0.0, 0.0, 1.0]
+
+
+@pytest.mark.parametrize("bad", ["1,2,3,4", "1,1260,a,b,c", "1,1260,nan,0,0", "1,1260,0,0,0,0"])
+def test_parse_lsm303d_status_rejects_garbage(bad):
+    with pytest.raises(ValueError):
+        parse_thermistor_message(bad)

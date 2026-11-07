@@ -9,13 +9,16 @@
 #define OUTPUT 1
 #define ADC_11db 3
 
+#define HEX 16
+
 namespace stub {
-extern uint32_t now_ms;
+extern uint64_t now_us;  // simulated time
 extern uint32_t rng;
 }
 
-inline uint32_t millis() { return stub::now_ms; }
-inline void delay(uint32_t ms) { stub::now_ms += ms; }
+inline uint32_t millis() { return (uint32_t)(stub::now_us / 1000); }
+inline uint32_t micros() { return (uint32_t)stub::now_us; }
+inline void delay(uint32_t ms) { stub::now_us += (uint64_t)ms * 1000; }
 inline void pinMode(int, int) {}
 inline void digitalWrite(int, int) {}
 inline void analogReadResolution(int) {}
@@ -45,6 +48,7 @@ struct SerialStub {
     template <typename T> void print(T) {}
     template <typename T> void print(T, int) {}
     template <typename T> void println(T) {}
+    template <typename T> void println(T, int) {}
     void println() {}
 };
 extern SerialStub Serial;

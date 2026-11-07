@@ -60,14 +60,32 @@ def temperatures_from_packet(packet: dict[str, Any], cfg: ThermistorConfig = The
 
 
 def parse_thermistor_message(text: str, cfg: ThermistorConfig = ThermistorConfig()) -> dict[str, Any]:
-    """Parse the machine1 BLE text message 'sequence,voltage_mV,resistance_ohms'."""
+    """Parse a machine1 BLE status message. Two formats are accepted:
+
+    'sequence,voltage_mV,resistance_ohms'          (thermistor-only firmware)
+    'sequence,voltage_mV,x_g,y_g,z_g'              (firmware with the LSM303D)
+    """
     parts = text.strip().split(",")
-    if len(parts) != 3:
-        raise ValueError(f"expected 'sequence,voltage_mV,resistance_ohms', got {text!r}")
-    sequence, voltage_mv, resistance = int(parts[0]), int(parts[1]), int(parts[2])
+    if len(parts) not in (3, 5):
+        raise ValueError(f"expected 3 or 5 comma-separated fields, got {text!r}")
+    sequence, voltage_mv = int(parts[0]), int(parts[1])
+    accel = None
+    if len(parts) == 3:
+        resistance: float | None = int(parts[2])
+    else:
+        accel = [float(p) for p in parts[2:]]
+        if not all(math.isfinite(a) for a in accel):
+            raise ValueError(f"non-finite acceleration in {text!r}")
+        try:
+            resistance = thermistor_resistance(voltage_mv, cfg)
+        except ValueError:
+            resistance = None
     try:
         temperature = voltage_to_celsius(voltage_mv, cfg)
     except ValueError:
         temperature = None
-    return {"sequence": sequence, "voltage_mv": voltage_mv, "resistance_ohm": resistance,
-            "temperature_c": temperature}
+    reading: dict[str, Any] = {"sequence": sequence, "voltage_mv": voltage_mv,
+                               "resistance_ohm": resistance, "temperature_c": temperature}
+    if accel is not None:
+        reading["accel_g"] = accel
+    return reading
