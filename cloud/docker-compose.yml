@@ -1,0 +1,16 @@
+# Local Postgres for development only. The deployed app uses Amazon RDS.
+# Start:  docker compose up -d     Stop:  docker compose down
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: smolbugs
+      POSTGRES_PASSWORD: smolbugs # local only, not a secret
+      POSTGRES_DB: smolbugs
+    ports:
+      - "5433:5432" # 5433 on the laptop, so it doesn't clash with another local Postgres
+    volumes:
+      - smolbugs-db:/var/lib/postgresql/data
+
+volumes:
+  smolbugs-db:

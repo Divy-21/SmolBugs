@@ -1,0 +1,84 @@
+// SmolBugs cloud database.
+//
+// Packet formats are still being agreed in Discord, so every table keeps the
+// packet exactly as received in `payload` and pulls out only the few fields the
+// dashboard needs. If the format changes, old rows still hold everything.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// One monitored machine, e.g. "MG-001". Created automatically the first time a
+// packet names it.
+model Machine {
+  id         String    @id // the packets' machine_id
+  name       String?
+  kind       String? // "band_saw", "drill", ...
+  rpm        Float? // running speed, for 1x/2x harmonics
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime?
+
+  statusPackets StatusPacket[]
+  windows       VibrationWindow[]
+  alerts        Alert[]
+}
+
+// Slow-rate status packet from the device (Kelvin's format): thermistor and
+// other sensors, a few times a second.
+model StatusPacket {
+  id           Int      @id @default(autoincrement())
+  machineId    String
+  machine      Machine  @relation(fields: [machineId], references: [id])
+  receivedAt   DateTime @default(now()) // server clock; the ESP32 has none
+  deviceTimeMs BigInt? // timestamp_ms: device uptime
+  bootId       String?
+  seq          Int?
+  thermistorMv Int? // first thermistor's divider voltage
+  temperatureC Float? // only if the gateway already converted it
+  payload      Json
+
+  @@index([machineId, receivedAt])
+}
+
+// One analysed vibration window: the output of Xavion's analyze_window()
+// (FFT per axis), posted by the gateway once a window is reassembled.
+model VibrationWindow {
+  id              Int      @id @default(autoincrement())
+  machineId       String
+  machine         Machine  @relation(fields: [machineId], references: [id])
+  receivedAt      DateTime @default(now())
+  windowId        Int
+  firstSampleMs   BigInt?
+  sampleRateHz    Float
+  nSamples        Int
+  clippedFraction Float?
+  // Summaries across the three axes, for charts and alerts:
+  dominantFreqHz  Float? // from the axis with the largest dominant peak
+  dominantAmpG    Float?
+  velocityRmsMmS  Float? // largest of the three axes
+  temperatureC    Float?
+  health          Float? // 0-100, filled in by scoring once it exists
+  warnings        Json?
+  axes            Json // analyze_window()["axes"], unchanged
+  payload         Json
+
+  @@index([machineId, receivedAt])
+}
+
+model Alert {
+  id         Int       @id @default(autoincrement())
+  machineId  String
+  machine    Machine   @relation(fields: [machineId], references: [id])
+  createdAt  DateTime  @default(now())
+  severity   String // "watch" | "alert"
+  kind       String // e.g. "imbalance", "overheat"
+  message    String
+  resolvedAt DateTime?
+
+  @@index([machineId, createdAt])
+}
