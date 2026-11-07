@@ -14,7 +14,7 @@ static SSD1306Wire display(
 // Thermistor configuration
 const int THERMISTOR_PIN = 1;
 
-const float FIXED_RESISTOR = 100000.0; // 100 kOhm
+const float FIXED_RESISTOR = 75000.0; // 75 kOhm
 const float SUPPLY_VOLTAGE = 3.3;     // 3.3 V
 
 unsigned long lastUpdate = 0;
