@@ -30,6 +30,7 @@ type LivePoint = {
 
 type LiveMachine = {
   machine_id: string;
+  limits?: Limits; // this machine's own limits (some machines override the shared ones)
   in_alert: boolean;
   buffered: number;
   dropped: number;
@@ -282,7 +283,7 @@ export default function Dashboard() {
             id={selected}
             now={now}
             live={liveOf(selected)}
-            limits={live.data?.limits ?? null}
+            limits={liveOf(selected)?.limits ?? live.data?.limits ?? null}
             info={infoOf(selected)}
             alerts={alertsOf(selected)}
           />
@@ -331,7 +332,8 @@ function Fleet(props: {
           const points = live?.recent ?? [];
           const last = points.at(-1);
           const temp = tempSeries(points);
-          const vib = spreadSeries(points, limits?.vibration_window ?? 20);
+          const lim = live?.limits ?? limits;
+          const vib = spreadSeries(points, lim?.vibration_window ?? 20);
           const isSel = id === selected;
           return (
             <li key={id} className="border-b border-slate-100 last:border-b-0">
@@ -351,8 +353,8 @@ function Fleet(props: {
                   </span>
                 </span>
                 <span className={`text-sm font-medium ${HEALTH[health].text}`}>{HEALTH[health].label}</span>
-                <Reading value={temp.at(-1)?.v} digits={1} unit="°C" points={temp} limit={limits?.temp_max_c ?? null} />
-                <Reading value={vib.at(-1)?.v} digits={3} unit="g" points={vib} limit={limits?.vibration_std_max_g ?? null} />
+                <Reading value={temp.at(-1)?.v} digits={1} unit="°C" points={temp} limit={lim?.temp_max_c ?? null} />
+                <Reading value={vib.at(-1)?.v} digits={3} unit="g" points={vib} limit={lim?.vibration_std_max_g ?? null} />
                 <span className="text-right text-sm tabular-nums text-slate-500 max-md:hidden">
                   {last ? ago(now, last.t) : "never"}
                 </span>
@@ -452,7 +454,7 @@ function MachineView(props: {
           ) : tempStored.length > 1 ? (
             <Chart points={tempStored} limit={limits?.temp_max_c ?? null} limitLabel={limits ? `${limits.temp_max_c} °C` : ""} span="10 min" />
           ) : (
-            <Empty>Stored readings appear here about every 30 seconds.</Empty>
+            <Empty>Stored readings appear here within a few seconds.</Empty>
           )}
         </Measure>
 

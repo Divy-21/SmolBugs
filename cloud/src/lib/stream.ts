@@ -43,7 +43,14 @@ export type StreamConfig = {
   vibrationWindow: number;
   maxBufferPerMachine: number; // oldest dropped beyond this if the database stays down
   thermistor: ThermistorConfig;
+  machineLimits: Record<string, MachineLimits>; // per-machine overrides, by machine_id
 };
+
+// The limits one machine can override (a running drill shakes far more than an idle lathe).
+export type MachineLimits = Partial<
+  Pick<StreamConfig, "tempMaxC" | "tempRiseCPerMin" | "shockToleranceG" | "vibrationStdMaxG">
+>;
+const LIMIT_KEYS = ["tempMaxC", "tempRiseCPerMin", "shockToleranceG", "vibrationStdMaxG"] as const;
 
 // Starting values only. Set the real ones from your own test runs (env vars below).
 export const DEFAULT_CONFIG: StreamConfig = {
@@ -65,7 +72,39 @@ export const DEFAULT_CONFIG: StreamConfig = {
     beta: 3950,
     ntcOnLowSide: true,
   },
+  machineLimits: {
+    // Calibrated from the real board on the drill, Sat Nov 7 (150 packets, boot d94bfa16): while it ran
+    // normally, the spread of 20 readings was 0.36-1.54 g and single readings were up to 2.36 g away
+    // from 1 g (idle: 0.01 g and 0.12 g). The shared limits flagged every second of normal running.
+    // These sit about 30% above what normal running reached.
+    "MG-001": { vibrationStdMaxG: 2.0, shockToleranceG: 3.0 },
+  },
 };
+
+// MACHINE_LIMITS='{"MG-002": {"vibrationStdMaxG": 0.3}}' adds to or replaces the defaults above,
+// per machine. Unknown keys and non-numbers are ignored; invalid JSON is logged and ignored.
+function machineLimitsFromEnv(raw: string | undefined, base: Record<string, MachineLimits>) {
+  const merged: Record<string, MachineLimits> = { ...base };
+  if (!raw) return merged;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    console.error("MACHINE_LIMITS is not valid JSON; using the built-in per-machine limits");
+    return merged;
+  }
+  if (typeof parsed !== "object" || parsed === null) return merged;
+  for (const [id, limits] of Object.entries(parsed)) {
+    if (typeof limits !== "object" || limits === null) continue;
+    const own: MachineLimits = {};
+    for (const k of LIMIT_KEYS) {
+      const v = (limits as Record<string, unknown>)[k];
+      if (typeof v === "number" && Number.isFinite(v) && v > 0) own[k] = v;
+    }
+    merged[id] = { ...merged[id], ...own };
+  }
+  return merged;
+}
 
 export function configFromEnv(env: Record<string, string | undefined> = process.env): StreamConfig {
   const d = DEFAULT_CONFIG;
@@ -92,6 +131,7 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
       beta: num("THERMISTOR_BETA", d.thermistor.beta),
       ntcOnLowSide: d.thermistor.ntcOnLowSide,
     },
+    machineLimits: machineLimitsFromEnv(env.MACHINE_LIMITS, d.machineLimits),
   };
 }
 
@@ -288,6 +328,12 @@ export class StreamBuffer {
     this.timer = null;
   }
 
+  // The limits for one machine: the shared ones, with that machine's overrides on top.
+  cfgFor(machineId: string): StreamConfig {
+    const own = this.cfg.machineLimits[machineId];
+    return own ? { ...this.cfg, ...own } : this.cfg;
+  }
+
   add(r: IncomingReading): AddResult {
     const s = this.state(r.machineId);
 
@@ -299,7 +345,7 @@ export class StreamBuffer {
       if (s.seenOrder.length > DUPLICATE_MEMORY) s.seen.delete(s.seenOrder.shift() as string);
     }
 
-    const { temperatureC, flags } = evaluate(r, s.history, this.cfg);
+    const { temperatureC, flags } = evaluate(r, s.history, this.cfgFor(r.machineId));
     const stored: StoredReading = { ...r, temperatureC, flags, abnormal: false };
 
     s.history.push(stored);
@@ -365,22 +411,24 @@ export class StreamBuffer {
     };
   }
 
-  // Recent packets straight from memory, for the dashboard: the database only
-  // gets normal packets every 30 s, so this is what makes the dashboard live.
+  // Recent packets straight from memory, for the dashboard: the database is
+  // written every few seconds, so this is what makes the dashboard live.
+  // `limits` are the shared ones; each machine also carries its own.
   live(maxPoints = 140) {
-    const c = this.cfg;
+    const limitsOf = (c: StreamConfig) => ({
+      temp_max_c: c.tempMaxC,
+      temp_rise_c_per_min: c.tempRiseCPerMin,
+      shock_tolerance_g: c.shockToleranceG,
+      vibration_std_max_g: c.vibrationStdMaxG,
+      vibration_window: c.vibrationWindow,
+      confirm_count: c.confirmCount,
+      flush_interval_ms: c.flushIntervalMs,
+    });
     return {
-      limits: {
-        temp_max_c: c.tempMaxC,
-        temp_rise_c_per_min: c.tempRiseCPerMin,
-        shock_tolerance_g: c.shockToleranceG,
-        vibration_std_max_g: c.vibrationStdMaxG,
-        vibration_window: c.vibrationWindow,
-        confirm_count: c.confirmCount,
-        flush_interval_ms: c.flushIntervalMs,
-      },
+      limits: limitsOf(this.cfg),
       machines: [...this.machines].map(([id, s]) => ({
         machine_id: id,
+        limits: limitsOf(this.cfgFor(id)),
         in_alert: s.inAlert,
         buffered: s.buffer.length,
         dropped: s.dropped,

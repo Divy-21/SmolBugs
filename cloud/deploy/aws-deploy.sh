@@ -93,19 +93,29 @@ secret_exists smolbugs/device-keys ||
   aws secretsmanager create-secret --name smolbugs/device-keys --secret-string "$(openssl rand -hex 16)" >/dev/null
 DB_URL_ARN=$(aws secretsmanager describe-secret --secret-id smolbugs/database-url --query ARN --output text)
 KEYS_ARN=$(aws secretsmanager describe-secret --secret-id smolbugs/device-keys --query ARN --output text)
+# Phone alerts (lib/notify.ts): a random ntfy.sh topic. Subscribe to it in the ntfy app; whoever
+# knows it can read the alerts, so it's a secret. Print it with the same command as the device key.
+secret_exists smolbugs/ntfy-topic ||
+  aws secretsmanager create-secret --name smolbugs/ntfy-topic --secret-string "smolbugs-$(openssl rand -hex 8)" >/dev/null
+NTFY_ARN=$(aws secretsmanager describe-secret --secret-id smolbugs/ntfy-topic --query ARN --output text)
 
 # --- 4. The service --------------------------------------------------------------
 say "Logs and cluster"
 aws logs create-log-group --log-group-name "/ecs/$APP" 2>/dev/null || true
 aws ecs create-cluster --cluster-name default >/dev/null
 
+SERVICE_ARN="arn:aws:ecs:$REGION:$ACCOUNT:service/default/$APP"
+# The dashboard's address, so tapping a phone alert opens it (empty on the very first deploy).
+APP_URL=$(aws ecs describe-express-gateway-service --service-arn "$SERVICE_ARN" --output json 2>/dev/null |
+  grep -o 'https://[^"]*\.on\.aws' | head -1 || true)
 CONTAINER=$(cat <<JSON
 {"image":"$REPO:$TAG","containerPort":3000,
  "awsLogsConfiguration":{"logGroup":"/ecs/$APP","logStreamPrefix":"ecs"},
- "secrets":[{"name":"DATABASE_URL","valueFrom":"$DB_URL_ARN"},{"name":"DEVICE_KEYS","valueFrom":"$KEYS_ARN"}]}
+ "environment":[{"name":"APP_URL","value":"$APP_URL"}],
+ "secrets":[{"name":"DATABASE_URL","valueFrom":"$DB_URL_ARN"},{"name":"DEVICE_KEYS","valueFrom":"$KEYS_ARN"},
+            {"name":"NTFY_TOPIC","valueFrom":"$NTFY_ARN"}]}
 JSON
 )
-SERVICE_ARN="arn:aws:ecs:$REGION:$ACCOUNT:service/default/$APP"
 if aws ecs describe-express-gateway-service --service-arn "$SERVICE_ARN" >/dev/null 2>&1; then
   say "Rolling out $TAG"
   # Exactly one task: the status endpoint buffers packets in memory (lib/stream.ts).
@@ -125,3 +135,4 @@ fi
 say "Service URL"
 aws ecs describe-express-gateway-service --service-arn "$SERVICE_ARN" --output json | grep -o 'https\?://[^"]*ecs\.on\.aws[^"]*' | sort -u || true
 echo "Device key: aws secretsmanager get-secret-value --region $REGION --secret-id smolbugs/device-keys --query SecretString --output text"
+echo "Phone-alert topic: same command with --secret-id smolbugs/ntfy-topic"

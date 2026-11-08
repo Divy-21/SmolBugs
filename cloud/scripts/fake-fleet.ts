@@ -30,10 +30,10 @@ type Sim = {
 };
 
 const fleet: Sim[] = [
-  { id: "MG-001", name: "Drill press", kind: "drill", rpm: 1800, baseMv: 1580, shakeG: 0.01 },
-  { id: "MG-002", name: "Band saw", kind: "band_saw", rpm: 1450, baseMv: 1500, shakeG: 0.025 },
-  { id: "MG-003", name: "Lathe", kind: "lathe", rpm: 1200, baseMv: 1620, shakeG: 0.015 },
-  { id: "MG-004", name: "Air compressor", kind: "compressor", rpm: 3000, baseMv: 1350, shakeG: 0.04 },
+  { id: "SIM-001", name: "Drill press", kind: "drill", rpm: 1800, baseMv: 1580, shakeG: 0.01 },
+  { id: "SIM-002", name: "Band saw", kind: "band_saw", rpm: 1450, baseMv: 1500, shakeG: 0.025 },
+  { id: "SIM-003", name: "Lathe", kind: "lathe", rpm: 1200, baseMv: 1620, shakeG: 0.015 },
+  { id: "SIM-004", name: "Air compressor", kind: "compressor", rpm: 3000, baseMv: 1350, shakeG: 0.04 },
 ].map((m) => ({
   ...m,
   faultSince: null,

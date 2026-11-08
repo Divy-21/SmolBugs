@@ -179,9 +179,52 @@ test("shock and vibration spread", () => {
   let flags: string[] = [];
   for (let i = 0; i < 20; i++) {
     const s = i % 2 === 0 ? 0.3 : -0.3; // shaking ±0.3 g on x
+    flags = buf.add(reading({ machineId: "MG-002", accel: { x: s, y: 0, z: 1 } })).flags; // shared limits
+  }
+  assert.deepEqual(flags, ["vibration_high"]);
+});
+
+test("MG-001 (the drill) has its own wider limits; other machines keep the shared ones", () => {
+  // ±0.8 g on x and z: about what the real drill did while running normally (spread ~1.1 g)
+  const shake = (id: string) => {
+    const buf = new StreamBuffer(recorder().persist, cfg);
+    let flags: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      const s = i % 2 === 0 ? 0.8 : -0.8;
+      flags = buf.add(reading({ machineId: id, accel: { x: s, y: 0, z: 1 + s } })).flags;
+    }
+    return flags;
+  };
+  assert.deepEqual(shake("MG-001"), []);
+  assert.deepEqual(shake("MG-002"), ["vibration_high"]); // last packet (-0.8, 0, 0.2) is only 0.18 g off 1 g
+
+  // far beyond normal running still alerts on the drill
+  const buf = new StreamBuffer(recorder().persist, cfg);
+  let flags: string[] = [];
+  for (let i = 0; i < 20; i++) {
+    const s = i % 2 === 0 ? 3.0 : -3.0;
     flags = buf.add(reading({ accel: { x: s, y: 0, z: 1 } })).flags;
   }
   assert.deepEqual(flags, ["vibration_high"]);
+  // one reading 3.5 g off 1 g (more than the drill ever did) is a shock even on the drill
+  assert.deepEqual(new StreamBuffer(recorder().persist, cfg).add(reading({ accel: { x: 0, y: 0, z: 4.5 } })).flags, ["shock"]);
+});
+
+test("per-machine limits from MACHINE_LIMITS add to the built-in ones; bad input is ignored", () => {
+  const c = configFromEnv({ MACHINE_LIMITS: '{"MG-002": {"vibrationStdMaxG": 0.4, "tempMaxC": "hot", "bogus": 1}}' });
+  assert.deepEqual(c.machineLimits["MG-002"], { vibrationStdMaxG: 0.4 });
+  assert.equal(c.machineLimits["MG-001"]?.vibrationStdMaxG, 2.0); // built-in kept
+  const bad = configFromEnv({ MACHINE_LIMITS: "{not json" });
+  assert.deepEqual(bad.machineLimits, DEFAULT_CONFIG.machineLimits);
+
+  const buf = new StreamBuffer(recorder().persist, { ...cfg, machineLimits: c.machineLimits });
+  buf.add(reading({ machineId: "MG-002" }));
+  buf.add(reading({ machineId: "MG-003" }));
+  const live = buf.live();
+  const lim = (id: string) => live.machines.find((m) => m.machine_id === id)?.limits.vibration_std_max_g;
+  assert.equal(lim("MG-002"), 0.4);
+  assert.equal(lim("MG-003"), cfg.vibrationStdMaxG);
+  assert.equal(live.limits.vibration_std_max_g, cfg.vibrationStdMaxG);
 });
 
 test("temperature rising too fast", () => {

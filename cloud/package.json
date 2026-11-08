@@ -9,6 +9,7 @@
     "lint": "eslint",
     "fake-device": "tsx scripts/fake-device.ts",
     "fake-fleet": "tsx scripts/fake-fleet.ts",
+    "test": "node --test scripts/stream.test.mts scripts/notify.test.mts",
     "db:up": "docker compose up -d",
     "db:migrate": "prisma migrate dev",
     "db:studio": "prisma studio",

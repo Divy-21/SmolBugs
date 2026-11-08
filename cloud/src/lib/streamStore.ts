@@ -1,5 +1,6 @@
 import type { Prisma } from "@/generated/prisma/client";
 import { db } from "@/lib/db";
+import { notifyAlerts } from "@/lib/notify";
 import { StreamBuffer, configFromEnv, type Batch } from "@/lib/stream";
 
 // The one StreamBuffer for this server process, created on first use (like
@@ -78,6 +79,7 @@ async function persistBatch({ readings, events }: Batch): Promise<void> {
       }
     }
   });
+  notifyAlerts(events); // only once the transaction has committed
 }
 
 // The host stops the server with SIGTERM. Try to write what's held (5 s at most)

@@ -37,10 +37,10 @@ be stored, last database write). "No signal" means readings stopped arriving, wh
 machine.
 
 The live tiles come from `GET /api/v1/live` (memory, updated every packet); the 10-minute trend and the history
-come from the database, so they lag by up to 30 s.
+come from the database, so they lag by a few seconds.
 
 To demo without hardware, run `npm run fake-fleet`: four simulated machines (drill press, band saw, lathe, air
-compressor). Press `1`-`4` to start or stop a fault on one (shaking and overheating; it cools down afterwards) and
+compressor) as `SIM-001`…`SIM-004`, so they never mix with the real board's `MG-001`. Press `1`-`4` to start or stop a fault on one (shaking and overheating; it cools down afterwards) and
 `q` `w` `e` `r` to cut or restore its signal. `npm run fake-device` is a single machine (`f` toggles the fault).
 All of this data is simulated: say so when presenting it.
 
@@ -107,12 +107,22 @@ is a 503, so the gateway retries.
 `STREAM_CLEAR_COUNT` (6), `STREAM_FLUSH_MS` (2000), and `THERMISTOR_R0_OHM`, `THERMISTOR_BETA`,
 `THERMISTOR_FIXED_OHM`, `THERMISTOR_SUPPLY_MV`.
 
+**Per-machine limits** override the shared ones for one machine, because a running drill shakes far more than an
+idle lathe. Built in: `MG-001` (the real drill) allows a vibration spread of 2.0 g and a shock of 3.0 g, about 30%
+above what it reached while running normally on Sat Nov 7 (the shared 0.15 g flagged 62 of those 150 readings).
+Add or change machines with `MACHINE_LIMITS='{"MG-002": {"vibrationStdMaxG": 0.3, "tempMaxC": 70}}'` (keys:
+`tempMaxC`, `tempRiseCPerMin`, `shockToleranceG`, `vibrationStdMaxG`). The dashboard draws each machine's own limits.
+
+**Phone alerts** go through [ntfy](https://ntfy.sh) when `NTFY_TOPIC` is set: every alert that opens or closes is
+pushed to that topic, after it's stored. Install the ntfy app and subscribe to the topic. On AWS the topic is the
+secret `smolbugs/ntfy-topic` (anyone who knows it can read the alerts). `APP_URL` makes a tap open the dashboard.
+
 **Run one server process only** (the AWS service is pinned to one task; see `deploy/aws-deploy.sh`). The buffer is in memory: two would each hold half the packets and miss
 "3 in a row". A restart loses up to 2 s of held packets, and the gateway can't resend them (it deletes packets
 once it gets a 200). One snapshot every 0.5 s can't show vibration frequency (nothing above 1 Hz); that needs
 `/api/v1/windows`.
 
-Tests for the buffering and limits: `node --test scripts/stream.test.mts` (plain Node 22, no install).
+Tests for the buffering, limits and phone alerts: `npm test` (plain `node --test`, no extra install).
 
 ### Vibration window
 
@@ -147,4 +157,4 @@ post_to_cloud("/api/v1/windows", analyze_window(window, rpm=3000))
 
 ## Credits
 
-Next.js, React, Prisma, zod, node-postgres, Tailwind CSS, tsx.
+Next.js, React, Prisma, zod, node-postgres, Tailwind CSS, tsx. Phone alerts: ntfy (ntfy.sh).
