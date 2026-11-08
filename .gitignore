@@ -1,7 +1,15 @@
 __pycache__/
 *.pyc
+*.py[cod]
 data/
 models/
 
+<<<<<<< HEAD
+# Virtual environments
+venv/
+.venv/
+
+=======
 # Receiver settings (device key) for one laptop
 smolbugs.env
+>>>>>>> d9c74d2405fa5c3437fb846baea126ae8d82ef96
