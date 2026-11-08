@@ -8,6 +8,11 @@
 #include <vector>
 #include "Arduino.h"
 
+// M_PI isn't standard C++; MinGW's g++ on Windows (-std=c++17) doesn't define it.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 namespace stub {
 struct FakeLSM303D {
     uint8_t address = 0x1D;

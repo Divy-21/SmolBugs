@@ -26,19 +26,23 @@ $env:CLOUD_URL = "https://sm-db6bb08ece0d477c9e820f118f7e670c.ecs.ca-central-1.o
 $env:DEVICE_KEY = "<the key Manraj DMed>"
 ```
 
-Then run **one** of these:
+Then run the receiver. Both commands start the same program (Xavion's `ingest/ble_receiver.py`), which handles
+everything the `machine1` firmware sends: the status line every 0.5 s and the vibration windows every 10 s.
 
-| Script | Use it when | Command |
-|---|---|---|
-| Xavion's receiver (recommended) | Any firmware: JSON or CSV temperature **and** vibration windows (FFT) | `cd predictive-maintenance` then `python -m ingest.ble_receiver --cloud --out data/session1` |
-| Kelvin's receiver | The board sends newline-terminated JSON status packets; temperature and accel snapshot only | `python "hardware scripts/machine1/receiver.py"` |
+| From | Command |
+|---|---|
+| the repo root | `python "hardware scripts/machine1/receiver.py" --out data/session1` (uploads automatically when both values are set) |
+| `predictive-maintenance/` | `python -m ingest.ble_receiver --cloud --out data/session1` |
+
+On Linux/macOS use `export CLOUD_URL=...` and `export DEVICE_KEY=...`, and `python3`.
 
 How to tell it's working:
-- Xavion's prints `Cloud upload: https://…on.aws` at the start; Kelvin's prints `Cloud upload ON: https://…on.aws`.
-  **If the address isn't the `.on.aws` one, it's going to the wrong place.** Kelvin's prints `Cloud upload OFF`
-  if either value is missing.
-- Every few seconds: `cloud: sent N | waiting 0 | … | rejected (400) 0`. `sent` going up and `waiting` near 0 =
-  data is arriving. `rejected` above 0 = a format problem (the line before it names the field).
+- At the start: `Cloud upload: https://…on.aws`. **If the address isn't the `.on.aws` one, it's going to the wrong
+  place.** `Cloud upload OFF` means one of the two values is missing.
+- `Vib   window N | dominant … Hz` lines every ~10 s. None after 20 s: look for `WARNING: MTU … < 200` (the
+  Bluetooth packet size is too small for vibration frames) or `Bad vibration frame`.
+- At the end (Ctrl+C): `cloud: sent N | waiting 0 | … | rejected (400) 0`. `rejected` above 0 = a format problem
+  (the line before it names the field).
 - Check from any browser: `{CLOUD_URL}/api/v1/machines` shows the machine with a fresh `lastSeenAt`.
 
 An all-zero accelerometer reading is treated as a dead sensor: three in a row open an alert. That's expected until
