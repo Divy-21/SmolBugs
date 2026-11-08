@@ -5,8 +5,9 @@ Jung et al. 2023). A bearing ran at about 1775 RPM under heavy load for 128 hour
 until it failed. One recording per hour: x/y vibration and bearing + room
 temperature at 25.6 kHz.
 
-To match our MPU-6050, every recording is cut down to 1000 Hz (the same bandwidth
-our sensor sees) before it goes through the same features as the drill.
+To match our LSM303D, every recording is cut down to settings.FS (1600 Hz, the same
+bandwidth our sensor sees) before it goes through the same features as the drill.
+Hours extracted at an older rate are re-extracted automatically.
 
     python -m ml.bearing_validation extract --zip "C:/Users/rimsh/Downloads/archive.zip"
     python -m ml.bearing_validation analyze
@@ -20,6 +21,7 @@ import argparse
 import re
 import time
 import zipfile
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +35,7 @@ SOURCE_FS = 25_600
 SECONDS = 10                     # 10 s from each hourly recording
 RUN_HZ = 1775 / 60               # bearing test speed, close to the drill's
 CACHE = Path("data/bearing")
+RATIO = Fraction(int(FS), SOURCE_FS)  # 1600 / 25600 = 1/16
 NAME_RE = re.compile(r"LogFile_(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\.csv$")
 
 
@@ -45,22 +48,32 @@ def extract(zip_path: str, limit_s: float = 150.0) -> None:
     for name in names:
         stamp = NAME_RE.search(name)[1]
         out = CACHE / f"{stamp}.npz"
-        if out.exists():
+        if out.exists() and cached_fs(out) == FS:
             done += 1
             continue
         if time.monotonic() - start > limit_s:
             break
         df = pd.read_csv(z.open(name), header=None, nrows=SOURCE_FS * SECONDS)
         vib = df.iloc[:, :2].to_numpy(dtype=float)
-        vib_1k = resample_poly(vib, up=5, down=128, axis=0)  # 25.6 kHz -> 1 kHz with anti-alias filter
-        np.savez(out, vib=vib_1k, bearing_c=float(df.iloc[:, 2].mean()), room_c=float(df.iloc[:, 3].mean()))
+        # 25.6 kHz -> FS with an anti-alias filter
+        vib_fs = resample_poly(vib, up=RATIO.numerator, down=RATIO.denominator, axis=0)
+        np.savez(out, vib=vib_fs, fs=FS, bearing_c=float(df.iloc[:, 2].mean()), room_c=float(df.iloc[:, 3].mean()))
         done += 1
     print(f"{done}/{len(names)} hours extracted to {CACHE}")
+
+
+def cached_fs(path: Path) -> float | None:
+    """Sample rate a cached hour was saved at (None for files from before this was recorded)."""
+    with np.load(path) as d:
+        return float(d["fs"]) if "fs" in d else None
 
 
 def load_hours() -> pd.DataFrame:
     rows = []
     for path in sorted(CACHE.glob("*.npz")):
+        if cached_fs(path) != FS:
+            raise SystemExit(f"{path.name} was extracted at a different sample rate than {FS:.0f} Hz: "
+                             "run the extract step again (it redoes only those hours)")
         d = np.load(path)
         rows.append({"stamp": path.stem, "vib": d["vib"], "bearing_c": float(d["bearing_c"]), "room_c": float(d["room_c"])})
     df = pd.DataFrame(rows)

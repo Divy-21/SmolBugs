@@ -1,10 +1,12 @@
-"""Turns one window of accelerometer data (plus temperature) into numbers the models use.
+"""Turns one window of accelerometer data (plus, optionally, temperature) into numbers the models use.
 
 Two layers:
 1. window_features(): raw features for one window. Uses the team's FFT code
    (processing.analyze_axis) and adds time-domain stats (RMS, kurtosis, crest...).
 2. relative_features(): divides those by the machine's own "normal" baseline, so a
    classifier trained on one install still works after the sensor is moved.
+
+Temperature is optional: leave it out (temp_c=None) until the thermistor is verified.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from .settings import DRILL_FFT
 
 AXES = ("x", "y", "z")
 EPS = 1e-6
+TEMP_COLUMNS = ("temp_c", "temp_slope_c_per_min")
 
 
 def time_features(signal: np.ndarray) -> dict[str, float]:
@@ -40,6 +43,8 @@ def time_features(signal: np.ndarray) -> dict[str, float]:
 
 def estimate_run_hz(windows: list[np.ndarray], fs: float, cfg: FFTConfig = DRILL_FFT) -> float:
     """Running speed in Hz: median dominant frequency of the strongest axis over normal windows."""
+    if not windows:
+        raise ValueError("need at least one window to estimate the running speed")
     freqs = []
     for w in windows:
         axis = int(np.argmax(np.std(w, axis=0)))
@@ -51,13 +56,19 @@ def estimate_run_hz(windows: list[np.ndarray], fs: float, cfg: FFTConfig = DRILL
 
 def window_features(
     accel_g: np.ndarray,
-    temp_c: float,
-    temp_slope_c_per_min: float,
-    run_hz: float | None,
+    temp_c: float | None = None,
+    temp_slope_c_per_min: float | None = None,
+    run_hz: float | None = None,
     fs: float = DRILL_FFT.sample_rate_hz,
     cfg: FFTConfig = DRILL_FFT,
 ) -> dict[str, float]:
-    """All raw features for one window. accel_g has shape (n, 3) with columns x, y, z in g."""
+    """All raw features for one window. accel_g has shape (n, 3) with columns x, y, z in g.
+
+    Temperature features are only added when temp_c is given (None = not used).
+    """
+    accel_g = np.asarray(accel_g, dtype=float)
+    if accel_g.ndim != 2 or accel_g.shape[1] != 3:
+        raise ValueError(f"accel_g must have shape (n, 3), got {accel_g.shape}")
     feats: dict[str, float] = {}
     for i, ax in enumerate(AXES):
         sig = accel_g[:, i]
@@ -71,8 +82,9 @@ def window_features(
             feats[f"{ax}_band_{band}"] = power
         for h in a.get("harmonics", []):
             feats[f"{ax}_h{h['order']}x"] = h["amp_g"]
-    feats["temp_c"] = float(temp_c)
-    feats["temp_slope_c_per_min"] = float(temp_slope_c_per_min)
+    if temp_c is not None:
+        feats["temp_c"] = float(temp_c)
+        feats["temp_slope_c_per_min"] = float(temp_slope_c_per_min or 0.0)
     return feats
 
 
@@ -88,6 +100,10 @@ def _log_ratio(a, b):
 
 def relative_features(raw: pd.DataFrame, baseline: pd.Series) -> pd.DataFrame:
     """Machine-independent features: everything compared to this machine's own baseline."""
+    missing = [f"{ax}_h1x" for ax in AXES if f"{ax}_h1x" not in raw.columns]
+    if missing:
+        raise ValueError("harmonic features missing: the running speed (run_hz) was not known "
+                         "when the features were computed")
     out = pd.DataFrame(index=raw.index)
     bands = sorted({c.split("_band_")[1] for c in raw.columns if "_band_" in c})
     for ax in AXES:
@@ -103,6 +119,7 @@ def relative_features(raw: pd.DataFrame, baseline: pd.Series) -> pd.DataFrame:
         out[f"{ax}_skew"] = raw[f"{ax}_skew"]
         out[f"{ax}_h2_over_h1"] = _log_ratio(raw[f"{ax}_h2x"], 1.0) - _log_ratio(raw[f"{ax}_h1x"], 1.0)
         out[f"{ax}_h3_over_h1"] = _log_ratio(raw[f"{ax}_h3x"], 1.0) - _log_ratio(raw[f"{ax}_h1x"], 1.0)
-    out["temp_rise_c"] = raw["temp_c"] - baseline["temp_c"]
-    out["temp_slope_c_per_min"] = raw["temp_slope_c_per_min"]
+    if "temp_c" in raw.columns:
+        out["temp_rise_c"] = raw["temp_c"] - baseline["temp_c"]
+        out["temp_slope_c_per_min"] = raw["temp_slope_c_per_min"]
     return out.fillna(0.0)
