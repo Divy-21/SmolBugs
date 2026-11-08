@@ -22,11 +22,13 @@ export function streamBuffer(): StreamBuffer {
 // Whether an alert is open lives in this process's memory (StreamBuffer), and a new process starts
 // with none open. An alert a previous process left open could then never close: the dashboard would
 // show the machine as Critical for good. So on start, close those; a machine still outside its
-// limits opens a fresh alert within 3 packets. Only alerts created before this process started.
+// limits opens a fresh alert within 3 packets. Runs before this process has written anything, so every
+// open alert is a leftover. (No createdAt filter: createdAt comes from the gateway laptop's clock,
+// which can run ahead of the server's, and a filter on it would leave such an alert stuck.)
 async function closeStaleAlerts(startedAt: Date): Promise<void> {
   try {
     const { count } = await db().alert.updateMany({
-      where: { resolvedAt: null, createdAt: { lt: startedAt } },
+      where: { resolvedAt: null },
       data: { resolvedAt: startedAt },
     });
     if (count > 0) console.log(`Closed ${count} alert(s) left open by the previous server process`);
