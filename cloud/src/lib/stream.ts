@@ -365,6 +365,40 @@ export class StreamBuffer {
     };
   }
 
+  // Recent packets straight from memory, for the dashboard: the database only
+  // gets normal packets every 30 s, so this is what makes the dashboard live.
+  live(maxPoints = 140) {
+    const c = this.cfg;
+    return {
+      limits: {
+        temp_max_c: c.tempMaxC,
+        temp_rise_c_per_min: c.tempRiseCPerMin,
+        shock_tolerance_g: c.shockToleranceG,
+        vibration_std_max_g: c.vibrationStdMaxG,
+        vibration_window: c.vibrationWindow,
+        confirm_count: c.confirmCount,
+        flush_interval_ms: c.flushIntervalMs,
+      },
+      machines: [...this.machines].map(([id, s]) => ({
+        machine_id: id,
+        in_alert: s.inAlert,
+        buffered: s.buffer.length,
+        dropped: s.dropped,
+        last_flush_at: s.lastFlushAt?.toISOString() ?? null,
+        last_error: s.lastError,
+        recent: s.history.slice(-maxPoints).map((r) => ({
+          t: r.receivedAt.toISOString(),
+          temperature_c: r.temperatureC,
+          accel: r.accel,
+          thermistor_valid: r.thermistorValid,
+          accel_valid: r.accelValid,
+          flags: r.flags,
+          abnormal: r.abnormal,
+        })),
+      })),
+    };
+  }
+
   private async flushNow(machineId?: string): Promise<boolean> {
     const ids = machineId === undefined ? [...this.machines.keys()] : [machineId];
     const taken: { s: MachineState; readings: StoredReading[]; events: AlertEvent[] }[] = [];
