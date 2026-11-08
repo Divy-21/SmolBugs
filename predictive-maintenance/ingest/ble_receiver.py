@@ -12,7 +12,7 @@ Run from the predictive-maintenance folder:
     python -m ingest.ble_receiver --simulate         # no hardware needed
     python -m ingest.ble_receiver --rpm 3000 --out data/session1
     python -m ingest.ble_receiver --rpm 3000 --out data/session1 --live-html
-    python -m ingest.ble_receiver --cloud            # also upload (needs CLOUD_URL and DEVICE_KEY)
+    python -m ingest.ble_receiver --cloud            # also upload (needs a device key; see ingest/cloud.py)
 
 Every status reading and analysed window carries boot_id, seq and packet_id (see ingest/cloud.py).
 """
@@ -37,6 +37,7 @@ from processing.ble_protocol import MIN_MTU, TEMPERATURE_CHAR_UUID, VIBRATION_CH
 
 DEVICE_NAME = "MachineGuard"
 MAX_JSON_BUFFER = 8192  # bytes; guards against a message that never ends
+NO_VIBRATION_WARN_S = 25.0  # the board sends a window every 10 s; say so if none has started by now
 
 
 class MachineGuardHandler:
@@ -301,16 +302,28 @@ async def run(handler: MachineGuardHandler, scanner_cls=None, client_cls=None,
                         "board will skip sending them.")
 
         await client.start_notify(TEMPERATURE_CHAR_UUID, lambda _s, d: handler.on_temperature(d))
+        vibration_subscribed = True
         try:
             await client.start_notify(VIBRATION_CHAR_UUID, lambda _s, d: handler.on_vibration(d))
         except Exception as err:  # older firmware without the vibration characteristic
+            vibration_subscribed = False
             handler.log(f"Vibration characteristic not available ({err}); temperature only.")
 
         handler.log("Receiving. Press Ctrl+C to stop.\n")
         elapsed = 0.0
+        frames_at_connect = handler.decoder.stats.frames
+        warned_no_vibration = not vibration_subscribed
         while client.is_connected and (duration_s is None or elapsed < duration_s):
             await asyncio.sleep(0.2)
             elapsed += 0.2
+            if (not warned_no_vibration and elapsed >= NO_VIBRATION_WARN_S
+                    and handler.decoder.stats.frames == frames_at_connect):
+                warned_no_vibration = True
+                handler.log(
+                    f"WARNING: no vibration data after {NO_VIBRATION_WARN_S:.0f} s (the board should send a "
+                    "window every 10 s). The board decides, and prints why on its USB serial output: "
+                    "Arduino IDE > Serial Monitor at 115200 baud, look for 'Vibration skipped: MTU' or "
+                    "'Vibration capture:'. Temperature readings are still being received.")
     handler.log("\n" + handler.summary())
     return True
 
@@ -324,7 +337,7 @@ def main(argv: list[str] | None = None) -> None:
                         help="keep <out>/fft_report.html updated after every window (needs --out)")
     parser.add_argument("--simulate", action="store_true", help="fake board, no Bluetooth needed")
     parser.add_argument("--cloud", action="store_true",
-                        help="also upload to the SmolBugs cloud (reads CLOUD_URL and DEVICE_KEY)")
+                        help="also upload to the SmolBugs cloud (device key from DEVICE_KEY or smolbugs.env)")
     parser.add_argument("--duration", type=float, help="stop after this many seconds")
     args = parser.parse_args(argv)
 

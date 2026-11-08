@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 data/
 models/
+
+# Receiver settings (device key) for one laptop
+smolbugs.env

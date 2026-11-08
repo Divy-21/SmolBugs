@@ -40,10 +40,17 @@ import urllib.request
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 STATUS_ENDPOINT = "/api/v1/status"
 WINDOWS_ENDPOINT = "/api/v1/windows"
+
+# The team's AWS deployment. CLOUD_URL (environment or settings file) overrides it.
+DEFAULT_CLOUD_URL = "https://sm-db6bb08ece0d477c9e820f118f7e670c.ecs.ca-central-1.on.aws"
+# KEY=VALUE lines (CLOUD_URL, DEVICE_KEY) saved once per laptop; .gitignore keeps it out of git.
+# SMOLBUGS_ENV_FILE points somewhere else (tests use it).
+SETTINGS_FILE = Path(__file__).resolve().parents[2] / "smolbugs.env"
 
 
 # ---------------------------------------------------------------- identity
@@ -360,11 +367,51 @@ class CloudSender:
                 f"dropped (backlog full) {s.dropped_backlog} | rejected (400) {s.dropped_rejected}")
 
 
+def settings_file() -> Path:
+    return Path(os.environ.get("SMOLBUGS_ENV_FILE") or SETTINGS_FILE)
+
+
+def read_settings(path: Path | None = None) -> dict[str, str]:
+    """KEY=VALUE pairs from the settings file; {} if it doesn't exist."""
+    path = path or settings_file()
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {}
+    settings = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        settings[name.strip()] = value.strip().strip("\"'")
+    return settings
+
+
+def save_setting(name: str, value: str, path: Path | None = None) -> Path:
+    """Set one KEY=VALUE in the settings file, keeping its other lines."""
+    path = path or settings_file()
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        lines = ["# SmolBugs receiver settings for this laptop. Never commit or share this file."]
+    lines = [l for l in lines if l.partition("=")[0].strip() != name] + [f"{name}={value}"]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def cloud_settings() -> tuple[str, str]:
+    """(url, key): environment variables first, then the settings file; the URL defaults to AWS."""
+    saved = read_settings()
+    url = (os.environ.get("CLOUD_URL") or saved.get("CLOUD_URL") or DEFAULT_CLOUD_URL).strip()
+    key = (os.environ.get("DEVICE_KEY") or saved.get("DEVICE_KEY") or "").strip()
+    return url, key
+
+
 def sender_from_env(log: Callable[[str], None] = print, **kwargs) -> CloudSender:
-    """Build a CloudSender from CLOUD_URL and DEVICE_KEY. Raises ValueError if either is missing."""
-    url = os.environ.get("CLOUD_URL", "").strip()
-    key = os.environ.get("DEVICE_KEY", "").strip()
-    missing = [name for name, v in (("CLOUD_URL", url), ("DEVICE_KEY", key)) if not v]
-    if missing:
-        raise ValueError(f"set the {' and '.join(missing)} environment variable(s) to use --cloud")
+    """Build a CloudSender from cloud_settings(). Raises ValueError if there is no device key."""
+    url, key = cloud_settings()
+    if not key:
+        raise ValueError(f"no device key: set DEVICE_KEY, or put DEVICE_KEY=... in {settings_file()} "
+                         "(the receiver.py launcher asks for it once and saves it there)")
     return CloudSender(url, key, log=log, **kwargs)
