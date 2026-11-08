@@ -1,22 +1,20 @@
 import { z } from "zod";
 import { checkDeviceKey } from "@/lib/auth";
 import { db } from "@/lib/db";
-import {
-  statusPacket,
-  vibrationWindow,
-  type StatusPacket,
-  type VibrationWindow,
-} from "@/lib/packets";
+import { vibrationWindow, type VibrationWindow } from "@/lib/packets";
 import type { Prisma } from "@/generated/prisma/client";
 
 type Tx = Prisma.TransactionClient;
 
-// Shared handling for every ingest route: check the key, parse JSON, validate,
-// store inside one transaction, and answer with something a teammate can debug.
+// Shared handling for ingest routes that write straight to the database: check
+// the key, parse JSON, validate, store inside one transaction, and answer with
+// something a teammate can debug. (Status packets are buffered instead: see
+// app/api/v1/status/route.ts.)
 export async function ingest<T extends z.ZodType>(
   request: Request,
   schema: T,
-  store: (tx: Tx, packets: z.infer<T>[]) => Promise<void>,
+  // Returns how many rows were actually written (repeats are skipped).
+  store: (tx: Tx, packets: z.infer<T>[]) => Promise<number>,
 ): Promise<Response> {
   const denied = checkDeviceKey(request);
   if (denied) return denied;
@@ -42,11 +40,13 @@ export async function ingest<T extends z.ZodType>(
   }
 
   const packets = (Array.isArray(parsed.data) ? parsed.data : [parsed.data]) as z.infer<T>[];
-  await db().$transaction(async (tx) => {
+  const stored = await db().$transaction(async (tx) => {
     await touchMachines(tx, packets as { machine_id: string }[]);
-    await store(tx, packets);
+    return store(tx, packets);
   });
-  return Response.json({ ok: true, stored: packets.length });
+  // A packet whose packet_id is already stored (the gateway retried after a
+  // timeout that actually succeeded) is skipped and counted, not an error.
+  return Response.json({ ok: true, stored, duplicates: packets.length - stored });
 }
 
 // A machine row appears the first time a packet names it.
@@ -61,33 +61,21 @@ async function touchMachines(tx: Tx, packets: { machine_id: string }[]) {
   }
 }
 
-export const statusRoute = (request: Request) =>
-  ingest(request, statusPacket, async (tx, packets: StatusPacket[]) => {
-    await tx.statusPacket.createMany({
-      data: packets.map((p) => {
-        const thermistor = p.sensors.find((s) => s.type === "thermistor");
-        return {
-          machineId: p.machine_id,
-          deviceTimeMs: p.timestamp_ms === undefined ? null : BigInt(p.timestamp_ms),
-          bootId: p.boot_id ?? null,
-          seq: p.seq ?? null,
-          thermistorMv:
-            thermistor?.voltage_mv === undefined ? null : Math.round(thermistor.voltage_mv),
-          temperatureC: thermistor?.temperature_c ?? null,
-          payload: p as Prisma.InputJsonValue,
-        };
-      }),
-    });
-  });
-
+// Windows arrive every few seconds at most, so they're written straight away.
+// skipDuplicates + the unique packetId: a gateway retry doesn't store a window twice.
 export const windowRoute = (request: Request) =>
   ingest(request, vibrationWindow, async (tx, windows: VibrationWindow[]) => {
-    await tx.vibrationWindow.createMany({
+    const { count } = await tx.vibrationWindow.createMany({
+      skipDuplicates: true,
       data: windows.map((w) => {
         const axes = [w.axes.x, w.axes.y, w.axes.z];
         const peak = axes.reduce((a, b) => (b.dominant_amp_g > a.dominant_amp_g ? b : a));
         return {
           machineId: w.machine_id,
+          receivedAt: w.received_at_utc ? new Date(w.received_at_utc) : new Date(),
+          packetId: w.packet_id ?? null,
+          bootId: w.boot_id ?? null,
+          seq: w.seq ?? null,
           windowId: w.window_id,
           firstSampleMs: w.first_sample_ms == null ? null : BigInt(w.first_sample_ms),
           sampleRateHz: w.sample_rate_hz,
@@ -103,4 +91,5 @@ export const windowRoute = (request: Request) =>
         };
       }),
     });
+    return count;
   });

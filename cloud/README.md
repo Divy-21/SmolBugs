@@ -36,35 +36,69 @@ array of up to 100. Extra fields are allowed and kept: every row stores the pack
 
 | Route | What |
 |---|---|
-| `POST /api/v1/status` | Status packet (Kelvin's format): thermistor and other slow sensors |
+| `POST /api/v1/status` | Status packet every ~0.5 s: held in memory, written every 2 s; abnormal ones written at once |
+| `GET /api/v1/status` | What the status endpoint is holding in memory right now |
 | `POST /api/v1/windows` | One analysed vibration window: the output of Xavion's `analyze_window()` |
 | `GET /api/v1/machines` | Every machine, with its latest status packet and window |
 | `GET /api/v1/machines/{id}/readings?minutes=10` | Status packets and windows from the last N minutes, oldest first |
 | `GET /api/health` | `{"ok": true}`, for the load balancer; doesn't touch the database |
+
+Packets carrying a `packet_id` already in the database are skipped (unique index, `ON CONFLICT DO NOTHING`)
+and counted in the response's `duplicates`, so the gateway can retry safely.
 
 Machines are created automatically the first time a packet names them. Field-by-field formats are in
 `src/lib/packets.ts`.
 
 ### Status packet
 
+What `predictive-maintenance/ingest/cloud.py` sends (it batches up to 50 per request):
+
 ```json
 {
   "machine_id": "MG-001",
   "timestamp_ms": 96847,
-  "boot_id": "a91f",
-  "seq": 1234,
   "sensors": [
-    { "id": "sensor_0", "type": "thermistor", "voltage_mv": 1582 }
-  ]
+    { "id": "sensor_0", "type": "thermistor", "voltage_mv": 1582, "valid": true, "temperature_c": 33.6 },
+    { "id": "sensor_1", "type": "accelerometer", "x_g": 0.01, "y_g": -0.02, "z_g": 1.0, "valid": true },
+    { "id": "sensor_2", "type": "gyroscope", "x_dps": 0.1, "y_dps": 0.0, "z_dps": 0.2, "valid": true }
+  ],
+  "boot_id": "a91f3c02",
+  "seq": 1234,
+  "packet_id": "3f2a…",
+  "received_at_utc": "2026-11-07T17:58:52.177715+00:00"
 }
 ```
 
-`boot_id` and `seq` are optional but recommended: they let us spot reboots and dropped packets. If the gateway
-converts the thermistor to °C, add `"temperature_c"` to that sensor.
+Only `machine_id` and `sensors` are required. `temperature_c` may be `null` (the gateway couldn't convert it);
+then the cloud converts `voltage_mv` itself with the same constants.
+
+**Buffering.** Packets are held in memory and written to `StatusPacket` every 2 s, each with its own
+`received_at_utc` as `receivedAt` (server clock if missing). A packet seen before (same `packet_id`, or same
+`boot_id` + `seq`) is skipped, in memory and by a unique index, so gateway retries aren't stored twice.
+
+**Abnormal readings.** Each packet is checked for: temperature too high or rising too fast, one accelerometer
+reading far from 1 g (shock), recent accelerometer readings spread too wide (vibration), or a dead sensor
+(`valid: false`, all-zero accelerometer, thermistor at 0 V or 3.3 V). 3 abnormal packets in a row open an `Alert`,
+and that machine's held packets are written before the answer goes back; while the alert is open every
+abnormal packet is written at once. 6 normal packets in a row close it. If that immediate write fails the answer
+is a 503, so the gateway retries.
+
+**Limits** are env vars (defaults are placeholders, set them from test runs): `TEMP_MAX_C` (60),
+`TEMP_RISE_C_PER_MIN` (5), `SHOCK_TOLERANCE_G` (0.5), `VIBRATION_STD_MAX_G` (0.15), `STREAM_CONFIRM_COUNT` (3),
+`STREAM_CLEAR_COUNT` (6), `STREAM_FLUSH_MS` (2000), and `THERMISTOR_R0_OHM`, `THERMISTOR_BETA`,
+`THERMISTOR_FIXED_OHM`, `THERMISTOR_SUPPLY_MV`.
+
+**Run one server process only** (the AWS service is pinned to one task; see `deploy/aws-deploy.sh`). The buffer is in memory: two would each hold half the packets and miss
+"3 in a row". A restart loses up to 2 s of held packets, and the gateway can't resend them (it deletes packets
+once it gets a 200). One snapshot every 0.5 s can't show vibration frequency (nothing above 1 Hz); that needs
+`/api/v1/windows`.
+
+Tests for the buffering and limits: `node --test scripts/stream.test.mts` (plain Node 22, no install).
 
 ### Vibration window
 
-Exactly what `analyze_window(window, rpm=...)` returns, plus an optional `temperature_c`. See
+Exactly what `analyze_window(window, rpm=...)` returns, plus `temperature_c` (may be `null`) and the gateway's
+`boot_id`, `seq`, `packet_id` and `received_at_utc`. Written straight away; a retry with the same `packet_id` is skipped. See
 `fixtures/windows.json` for four real examples from Xavion's simulator.
 
 ### Sending from Python (the gateway)

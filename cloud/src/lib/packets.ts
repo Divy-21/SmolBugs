@@ -2,6 +2,19 @@ import { z } from "zod";
 
 // The packet formats the cloud accepts. Fields the team adds later are kept
 // (loose objects) and stored in `payload`; only the fields below are checked.
+//
+// Senders: predictive-maintenance/ingest/cloud.py (the gateway). It adds
+// boot_id, seq, packet_id and received_at_utc to everything it sends, turns
+// NaN into null, and retries with the same packet_id.
+
+// The gateway's packet_id (hash of machine|boot|kind|seq, see
+// predictive-maintenance/ingest/cloud.py). Optional; when present it must be unique.
+const packetId = z
+  .string()
+  .min(8)
+  .max(64)
+  .regex(/^[A-Za-z0-9_-]+$/, "packet_id may use letters, digits, _ - only")
+  .optional();
 
 const machineId = z
   .string()
@@ -10,31 +23,54 @@ const machineId = z
   .max(64)
   .regex(/^[A-Za-z0-9_.-]+$/, "machine_id may use letters, digits, _ . - only");
 
-// --- Status packet: Kelvin's format, posted by the gateway or the device ----
+// Identity fields the gateway adds. All optional, so a test script can leave them out.
+const identity = {
+  boot_id: z.string().max(64).optional(),
+  seq: z.number().int().nonnegative().optional(),
+  packet_id: packetId,
+  received_at_utc: z
+    .string()
+    .refine((s) => !Number.isNaN(Date.parse(s)), "received_at_utc must be an ISO 8601 time, e.g. 2026-11-07T17:58:52Z")
+    .optional(),
+};
+
+// --- Status packet: posted by the gateway every ~0.5 s per machine -------------
 //
 // { "machine_id": "MG-001", "timestamp_ms": 96847,
-//   "sensors": [ { "id": "sensor_0", "type": "thermistor", "voltage_mv": 1582 } ] }
+//   "sensors": [ { "id": "sensor_0", "type": "thermistor", "voltage_mv": 1582, "valid": true,
+//                  "temperature_c": 33.6 },
+//                { "id": "sensor_1", "type": "accelerometer", "x_g": 0.01, "y_g": -0.02, "z_g": 1.0,
+//                  "valid": true },
+//                { "id": "sensor_2", "type": "gyroscope", "x_dps": 0.1, "y_dps": 0.0, "z_dps": 0.2 } ],
+//   "boot_id": "a91f3c02", "seq": 1234, "packet_id": "…",
+//   "received_at_utc": "2026-11-07T17:58:52.177715+00:00" }
+//
+// timestamp_ms is missing for the CSV-format firmware. temperature_c and
+// resistance_ohm are null when the gateway couldn't convert the reading.
 
 const sensor = z.looseObject({
   id: z.string().min(1).max(64),
-  type: z.string().min(1).max(32), // "thermistor", "accelerometer", ...
-  voltage_mv: z.number().optional(),
-  temperature_c: z.number().optional(), // if the gateway converted it
+  type: z.string().min(1).max(32), // "thermistor", "accelerometer", "gyroscope", ...
+  valid: z.boolean().optional(),
+  voltage_mv: z.number().nullable().optional(),
+  temperature_c: z.number().nullable().optional(),
+  x_g: z.number().nullable().optional(),
+  y_g: z.number().nullable().optional(),
+  z_g: z.number().nullable().optional(),
 });
 
 export const statusPacket = z.looseObject({
   machine_id: machineId,
   timestamp_ms: z.number().int().nonnegative().optional(),
-  boot_id: z.string().max(64).optional(),
-  seq: z.number().int().nonnegative().optional(),
   sensors: z.array(sensor).max(32),
+  ...identity,
 });
 export type StatusPacket = z.infer<typeof statusPacket>;
 
 // --- Vibration window: Xavion's analyze_window() output -----------------------
 //
 // Posted by the gateway once a chunked window is reassembled and analysed.
-// Optional extra: temperature_c, if the gateway knows the latest temperature.
+// temperature_c is the latest temperature, or null if there isn't one yet.
 
 const axis = z.looseObject({
   dominant_freq_hz: z.number(),
@@ -61,7 +97,8 @@ export const vibrationWindow = z.looseObject({
   clipped_fraction: z.number().min(0).max(1).optional(),
   warnings: z.array(z.string()).optional(),
   axes: z.object({ x: axis, y: axis, z: axis }),
-  temperature_c: z.number().optional(),
+  temperature_c: z.number().nullable().optional(),
+  ...identity,
 });
 export type VibrationWindow = z.infer<typeof vibrationWindow>;
 

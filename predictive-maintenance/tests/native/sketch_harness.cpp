@@ -6,6 +6,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <fcntl.h>  // _setmode: stdout carries binary frames
+#include <io.h>
+#endif
 #include "Arduino.h"
 #include "BLEDevice.h"
 #include "Wire.h"
@@ -24,6 +28,11 @@ BLEServer* BLEDevice::server = nullptr;
 #include "machine1.ino"
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // Windows opens stdout in text mode and turns every 0x0A byte into 0x0D 0x0A,
+    // which corrupts the binary frames. Switch it to binary.
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     stub::FakeLSM303D imu;
     if (argc > 1) stub::peer_mtu = (uint16_t)atoi(argv[1]);
     if (argc > 2) imu.odr = atof(argv[2]);

@@ -6,6 +6,10 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <fcntl.h>  // _setmode: stdout carries binary frames
+#include <io.h>
+#endif
 
 #include "smolbugs_protocol.h"
 
@@ -55,6 +59,10 @@ static void writeFrame(const uint8_t* data, size_t len) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // Windows text-mode stdout turns 0x0A into 0x0D 0x0A and corrupts the frames.
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     unitChecks();
     if (failures) return 1;
 
