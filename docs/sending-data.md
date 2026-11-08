@@ -17,30 +17,35 @@ ESP32 --BLE or Wi-Fi--> laptop gateway --HTTPS--> SmolBugs cloud (AWS) --> datab
 | **Key** | Send it in the header `x-device-key`. Manraj DMs it; never commit it or post it in the channel. Locally: `dev-key-change-me` |
 | **AWS account?** | Not needed. The URL and the key are enough |
 
-## Run the board → cloud (PowerShell, on the laptop next to the board)
+## Run the board → cloud (on the laptop next to the board)
 
-Set the two values once per terminal:
+From the repo root, one command (Linux/macOS: `python3`):
 
-```powershell
-$env:CLOUD_URL = "https://sm-db6bb08ece0d477c9e820f118f7e670c.ecs.ca-central-1.on.aws"
-$env:DEVICE_KEY = "<the key Manraj DMed>"
+```
+python "hardware scripts/machine1/receiver.py"
 ```
 
-Then run the receiver. Both commands start the same program (Xavion's `ingest/ble_receiver.py`), which handles
-everything the `machine1` firmware sends: the status line every 0.5 s and the vibration windows every 10 s.
+- **The first time**, it asks for the device key (Manraj DMs it). Paste it; it's hidden while you type. It's saved
+  in `smolbugs.env` at the repo root, which git ignores, and you're never asked again on that laptop. The cloud
+  address is built in. No environment variables needed (`CLOUD_URL` / `DEVICE_KEY` still win if you set them).
+- **Every run is saved** to `data/run-<date>-<time>/` (temperature, FFT results, raw windows). Send that folder if
+  something looks wrong. `--out <folder>` picks another place.
+- `--simulate` runs a fake board and uploads it as `MG-SIM`, so it never mixes with the real `MG-001`.
+- `--no-cloud`: print and save only. Other options pass through: `--rpm 3000`, `--duration 60`, `--machine-id MG-002`.
 
-| From | Command |
-|---|---|
-| the repo root | `python "hardware scripts/machine1/receiver.py" --out data/session1` (uploads automatically when both values are set) |
-| `predictive-maintenance/` | `python -m ingest.ble_receiver --cloud --out data/session1` |
-
-On Linux/macOS use `export CLOUD_URL=...` and `export DEVICE_KEY=...`, and `python3`.
+It starts Xavion's `ingest/ble_receiver.py`, which handles everything the `machine1` firmware sends: the status
+line every 0.5 s and the vibration windows every 10 s. From `predictive-maintenance/`,
+`python -m ingest.ble_receiver --cloud --out data/session1` runs the same program directly (it reads the same
+`smolbugs.env`, but won't ask for the key).
 
 How to tell it's working:
 - At the start: `Cloud upload: https://…on.aws`. **If the address isn't the `.on.aws` one, it's going to the wrong
-  place.** `Cloud upload OFF` means one of the two values is missing.
-- `Vib   window N | dominant … Hz` lines every ~10 s. None after 20 s: look for `WARNING: MTU … < 200` (the
-  Bluetooth packet size is too small for vibration frames) or `Bad vibration frame`.
+  place.** `Cloud upload OFF` means there's no device key (run again and paste it).
+- `Vib   window N | dominant … Hz` lines every ~10 s. If none have come after 25 s, the receiver prints
+  `WARNING: no vibration data`. The board decides whether to send, and prints why on its USB cable: open the Arduino
+  IDE Serial Monitor at 115200 baud and look for `Vibration skipped: MTU` (Bluetooth packets too small) or
+  `Vibration capture: …` (accelerometer problem). Also look in the receiver output for `WARNING: MTU … < 200` or
+  `Bad vibration frame`.
 - At the end (Ctrl+C): `cloud: sent N | waiting 0 | … | rejected (400) 0`. `rejected` above 0 = a format problem
   (the line before it names the field).
 - Check from any browser: `{CLOUD_URL}/api/v1/machines` shows the machine with a fresh `lastSeenAt`.

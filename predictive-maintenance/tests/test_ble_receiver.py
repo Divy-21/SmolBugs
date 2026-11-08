@@ -463,9 +463,10 @@ def test_close_flushes_remaining():
     assert sender.backlog == 0 and sender.stats.sent == 3
 
 
-def test_cli_cloud_needs_env(monkeypatch):
+def test_cli_cloud_needs_env(monkeypatch, tmp_path):
     monkeypatch.delenv("CLOUD_URL", raising=False)
     monkeypatch.delenv("DEVICE_KEY", raising=False)
+    monkeypatch.setenv("SMOLBUGS_ENV_FILE", str(tmp_path / "none.env"))  # ignore a real saved key
     with pytest.raises(SystemExit):
         main(["--simulate", "--cloud", "--duration", "0.1"])
 
@@ -557,3 +558,50 @@ def test_worker_catches_up_without_waiting_a_second_per_batch():
         assert sender.backlog == 0 and len(cloud.calls) == 4
     finally:
         sender.close()
+
+
+# ---------------------------------------------------------------- settings file (device key saved once)
+
+def test_settings_file_supplies_key_and_env_wins(monkeypatch, tmp_path):
+    from ingest.cloud import DEFAULT_CLOUD_URL, cloud_settings, save_setting
+    f = tmp_path / "smolbugs.env"
+    monkeypatch.setenv("SMOLBUGS_ENV_FILE", str(f))
+    monkeypatch.delenv("CLOUD_URL", raising=False)
+    monkeypatch.delenv("DEVICE_KEY", raising=False)
+    assert cloud_settings() == (DEFAULT_CLOUD_URL, "")
+
+    f.write_text('# comment\nCLOUD_URL="http://localhost:3100"\n\nOTHER=1\n', encoding="utf-8")
+    save_setting("DEVICE_KEY", "k-1")
+    save_setting("DEVICE_KEY", "k-2")  # replaces, doesn't duplicate
+    text = f.read_text(encoding="utf-8")
+    assert text.count("DEVICE_KEY=") == 1 and "OTHER=1" in text and "# comment" in text
+    assert cloud_settings() == ("http://localhost:3100", "k-2")
+
+    monkeypatch.setenv("DEVICE_KEY", "from-env")
+    monkeypatch.setenv("CLOUD_URL", "http://example.test")
+    assert cloud_settings() == ("http://example.test", "from-env")
+
+
+def test_run_warns_when_board_sends_no_vibration(monkeypatch):
+    import ingest.ble_receiver as rx
+    monkeypatch.setattr(rx, "NO_VIBRATION_WARN_S", 0.4)
+    monkeypatch.setattr(FakeBoardClient, "window_interval_s", 100.0)
+
+    async def no_vibration(self, callback):
+        await asyncio.sleep(100)
+
+    monkeypatch.setattr(FakeBoardClient, "_vibration_loop", no_vibration)
+    h, lines = _quiet()
+    asyncio.run(run(h, FakeBoardScanner, FakeBoardClient, duration_s=1.0))
+    warnings = [l for l in lines if "no vibration data" in l]
+    assert len(warnings) == 1 and "Serial Monitor" in warnings[0]
+
+
+def test_run_no_vibration_warning_when_windows_arrive(monkeypatch):
+    import ingest.ble_receiver as rx
+    monkeypatch.setattr(rx, "NO_VIBRATION_WARN_S", 0.4)
+    monkeypatch.setattr(FakeBoardClient, "window_interval_s", 0.05)
+    monkeypatch.setattr(FakeBoardClient, "frame_gap_s", 0.0)
+    h, lines = _quiet()
+    asyncio.run(run(h, FakeBoardScanner, FakeBoardClient, duration_s=1.0))
+    assert h.window_count >= 1 and not any("no vibration data" in l for l in lines)
