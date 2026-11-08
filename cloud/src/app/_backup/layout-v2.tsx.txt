@@ -1,0 +1,30 @@
+import type { Metadata } from "next";
+import { Barlow, Barlow_Condensed } from "next/font/google";
+import "./globals.css";
+
+// Barlow is modelled on highway and industrial signage; the condensed cut is
+// used for status words and readings, like the figures on a gauge.
+const barlow = Barlow({
+  variable: "--font-barlow",
+  subsets: ["latin"],
+  weight: ["400", "500", "600"],
+});
+
+const barlowCondensed = Barlow_Condensed({
+  variable: "--font-barlow-condensed",
+  subsets: ["latin"],
+  weight: ["500", "600"],
+});
+
+export const metadata: Metadata = {
+  title: "SmolBugs · Machine condition",
+  description: "Temperature and vibration monitoring for existing machines",
+};
+
+export default function RootLayout({ children }: LayoutProps<"/">) {
+  return (
+    <html lang="en" className={`${barlow.variable} ${barlowCondensed.variable} h-full antialiased`}>
+      <body className="min-h-full flex flex-col">{children}</body>
+    </html>
+  );
+}

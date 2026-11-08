@@ -28,6 +28,22 @@ npm run fake-device
 
 Look at the data: `npm run db:studio` opens a table browser, or `curl localhost:3100/api/v1/machines`.
 
+## Dashboard
+
+Open `http://localhost:3100`. One page: every machine with a health status (Healthy, Warning, Critical,
+No signal), and for the selected machine its temperature and vibration with limit lines, the latest FFT
+window if any, the alert history, and a data-quality panel (last reading, sensor validity, readings waiting to
+be stored, last database write). "No signal" means readings stopped arriving, which is different from a healthy
+machine.
+
+The live tiles come from `GET /api/v1/live` (memory, updated every packet); the 10-minute trend and the history
+come from the database, so they lag by up to 30 s.
+
+To demo without hardware, run `npm run fake-fleet`: four simulated machines (drill press, band saw, lathe, air
+compressor). Press `1`-`4` to start or stop a fault on one (shaking and overheating; it cools down afterwards) and
+`q` `w` `e` `r` to cut or restore its signal. `npm run fake-device` is a single machine (`f` toggles the fault).
+All of this data is simulated: say so when presenting it.
+
 ## API
 
 Ingest routes need the header `x-device-key` (local value: `dev-key-change-me`). Each takes one packet or a JSON
@@ -41,6 +57,9 @@ array of up to 100. Extra fields are allowed and kept: every row stores the pack
 | `POST /api/v1/windows` | One analysed vibration window: the output of Xavion's `analyze_window()` |
 | `GET /api/v1/machines` | Every machine, with its latest status packet and window |
 | `GET /api/v1/machines/{id}/readings?minutes=10` | Status packets and windows from the last N minutes, oldest first |
+| `GET /api/v1/live` | Last ~70 s of status packets per machine from memory, plus the limits in use (the dashboard's live view) |
+| `GET /api/v1/alerts?machine_id=&limit=50` | Alerts, newest first |
+| `PUT /api/v1/machines/{id}` | Register a machine or set its `name`, `kind`, `rpm` (needs `x-device-key`) |
 | `GET /api/health` | `{"ok": true}`, for the load balancer; doesn't touch the database |
 
 Machines are created automatically the first time a packet names them. Field-by-field formats are in

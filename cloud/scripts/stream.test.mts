@@ -198,3 +198,17 @@ test("limits can be set from the environment", () => {
   assert.equal(c.flushIntervalMs, 10_000);
   assert.equal(c.thermistor.beta, DEFAULT_CONFIG.thermistor.beta); // bad value -> default
 });
+
+test("live() shows recent packets from memory, before they are written", () => {
+  const buf = new StreamBuffer(recorder().persist, cfg);
+  buf.add(reading());
+  buf.add(hot());
+  const live = buf.live();
+  assert.equal(live.limits.temp_max_c, cfg.tempMaxC);
+  const m = live.machines[0];
+  assert.equal(m.machine_id, "MG-001");
+  assert.equal(m.buffered, 2);
+  assert.equal(m.recent.length, 2);
+  assert.deepEqual(m.recent[1].flags, ["temp_high"]);
+  assert.equal(typeof m.recent[0].t, "string");
+});

@@ -40,15 +40,33 @@ async function post(path: string, body: unknown) {
   }
 }
 
+// SIMULATED data: healthy is ~34 °C and a still accelerometer (1 g on z). The
+// fault shakes the accelerometer (±0.3 g) and drops the divider voltage 6 mV/s,
+// i.e. the temperature climbs about 1 °C every 3 s.
+let faultSince = 0;
+const jitter = (g: number) => (Math.random() * 2 - 1) * g;
+
 setInterval(() => {
   const t = (Date.now() - started) / 1000;
-  const voltage = Math.round(1580 + 20 * Math.sin(t / 30) + (faulty ? -0.5 * t : 0));
+  const faultS = faulty ? (Date.now() - faultSince) / 1000 : 0;
+  const voltage = Math.max(200, Math.round(1580 + 20 * Math.sin(t / 30) - 6 * faultS));
+  const shake = faulty ? 0.3 : 0.01;
   void post("/api/v1/status", {
     machine_id: machineId,
     timestamp_ms: Date.now() - started,
     boot_id: bootId,
     seq: seq++,
-    sensors: [{ id: "sensor_0", type: "thermistor", voltage_mv: voltage }],
+    sensors: [
+      { id: "sensor_0", type: "thermistor", voltage_mv: voltage, valid: true },
+      {
+        id: "sensor_1",
+        type: "accelerometer",
+        x_g: +jitter(shake).toFixed(3),
+        y_g: +jitter(shake).toFixed(3),
+        z_g: +(1 + jitter(shake)).toFixed(3),
+        valid: true,
+      },
+    ],
   });
 }, 500);
 
@@ -65,7 +83,8 @@ if (process.stdin.isTTY) {
     if (k === "\u0003") process.exit(0);
     if (k === "f") {
       faulty = !faulty;
-      console.log(faulty ? "-> sending IMBALANCE" : "-> sending healthy");
+      faultSince = Date.now();
+      console.log(faulty ? "-> sending FAULT (shaking + overheating)" : "-> sending healthy");
     }
   });
 }

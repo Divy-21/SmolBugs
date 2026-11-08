@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+/* SmolBugs palette: graphite on machine grey, with status colours taken from
+   shop-floor andon lamps (red stop, amber attention, green normal). */
+:root {
+  --background: #edefec; /* machine grey */
+  --foreground: #1f2421; /* graphite */
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-paper: #edefec;
+  --color-ink: #1f2421;
+  --color-muted: #5d6762;
+  --color-rule: #d3d8d4;
+  --color-andon-red: #c1121f;
+  --color-andon-amber: #f2a900;
+  --color-andon-amber-ink: #6e4b00; /* amber text on light backgrounds, and text on amber */
+  --color-andon-green: #17784a;
+  --color-andon-off: #7d8782;
+  --font-sans: var(--font-barlow);
+  --font-condensed: var(--font-barlow-condensed);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-barlow), Arial, Helvetica, sans-serif;
+}
