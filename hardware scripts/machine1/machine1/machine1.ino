@@ -1,3 +1,12 @@
+// MachineGuard machine1: thermistor + LSM303D accelerometer over Bluetooth (BLE)
+//
+// Characteristics (Nordic UART base UUID):
+//   6E400003  status     text "sequence,voltage_mV,x_g,y_g,z_g" every 500 ms
+//   6E400004  vibration  binary START + DATA frames (smolbugs_protocol.h):
+//                        one 4096-sample window at ~1600 Hz every VIB_INTERVAL_MS
+//
+// smolbugs_protocol.h must be in the same folder as this sketch.
+
 #include <Arduino.h>
 #include "HT_SSD1306Wire.h"
 
@@ -7,6 +16,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+
+#include "smolbugs_protocol.h"
 
 // =====================================================
 // OLED CONFIGURATION
@@ -63,6 +74,33 @@ float accelerationX = 0.0;
 float accelerationY = 0.0;
 float accelerationZ = 0.0;
 
+// FIFO registers, used while capturing vibration windows.
+#define LSM303D_CTRL0     0x1F
+#define LSM303D_FIFO_CTRL 0x2E
+#define LSM303D_FIFO_SRC  0x2F
+
+
+// =====================================================
+// VIBRATION CAPTURE CONFIGURATION
+// =====================================================
+
+const float    VIB_NOMINAL_RATE_HZ = 1600.0f; // CTRL1 = 0xA7
+const uint16_t VIB_WINDOW_SAMPLES  = 4096;    // 2.56 s at 1600 Hz, 0.39 Hz resolution
+const uint8_t  VIB_RANGE_G         = 4;       // CTRL2 full scale
+const uint16_t VIB_LSB_PER_G       = 8197;    // 1 / 0.122 mg per LSB at +/-4 g
+
+const unsigned long VIB_INTERVAL_MS  = 10000; // one window every 10 s
+const unsigned long VIB_FRAME_GAP_MS = 10;    // pause between DATA frames
+
+// 4096 x 3 x 2 bytes = 24 KB of RAM.
+static int16_t vibBuffer[VIB_WINDOW_SAMPLES][3];
+
+uint16_t vibWindowId = 0;
+uint32_t vibWindowsSent = 0;
+uint32_t vibCaptureFailures = 0;
+uint32_t vibNotifyErrors = 0;
+unsigned long lastVibWindow = 0;
+
 
 // =====================================================
 // BLE CONFIGURATION
@@ -76,9 +114,14 @@ float accelerationZ = 0.0;
 #define CHARACTERISTIC_UUID_TX \
     "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
+#define CHARACTERISTIC_UUID_VIBRATION \
+    "6E400004-B5A3-F393-E0A9-E50E24DCCA9E"
+
 BLEServer* bleServer = nullptr;
 
 BLECharacteristic* txCharacteristic = nullptr;
+BLECharacteristic* vibCharacteristic = nullptr;
+BLE2902* vibCccd = nullptr;
 
 volatile bool deviceConnected = false;
 
@@ -108,6 +151,17 @@ class ServerCallbacks : public BLEServerCallbacks {
     }
 };
 
+// Counts failed vibration notifications so VIB_FRAME_GAP_MS can be tuned.
+class VibrationCallbacks : public BLECharacteristicCallbacks {
+
+    void onStatus(BLECharacteristic* characteristic, Status s, uint32_t code) override {
+
+        if (s != SUCCESS_NOTIFY) {
+            vibNotifyErrors++;
+        }
+    }
+};
+
 
 // =====================================================
 // OLED POWER
@@ -129,6 +183,9 @@ void initializeBLE() {
 
     BLEDevice::init(DEVICE_NAME);
 
+    // Ask for a large MTU so a 197-byte DATA frame fits in one notification.
+    BLEDevice::setMTU(247);
+
     bleServer = BLEDevice::createServer();
 
     bleServer->setCallbacks(
@@ -146,6 +203,20 @@ void initializeBLE() {
 
     txCharacteristic->addDescriptor(
         new BLE2902()
+    );
+
+    vibCharacteristic =
+        uartService->createCharacteristic(
+            CHARACTERISTIC_UUID_VIBRATION,
+            BLECharacteristic::PROPERTY_NOTIFY
+        );
+
+    vibCccd = new BLE2902();
+
+    vibCharacteristic->addDescriptor(vibCccd);
+
+    vibCharacteristic->setCallbacks(
+        new VibrationCallbacks()
     );
 
     uartService->start();
@@ -291,16 +362,23 @@ bool initializeAccelerometer() {
         return false;
     }
 
-    // CTRL2 = 0x08
-    // Accelerometer full scale: +/- 4g.
+    // CTRL2 = 0x88
+    // Anti-alias filter 362 Hz (bits 7:6 = 10), full scale +/- 4g.
+    // At 1600 Hz the FFT can only represent up to 800 Hz; the filter stops
+    // higher vibration from folding back as false peaks.
 
     if (!writeRegister(
         LSM303D_ADDRESS,
         LSM303D_CTRL2,
-        0x08
+        0x88
     )) {
         return false;
     }
+
+    // FIFO off until a vibration window is captured.
+
+    writeRegister(LSM303D_ADDRESS, LSM303D_FIFO_CTRL, 0x00);
+    writeRegister(LSM303D_ADDRESS, LSM303D_CTRL0, 0x00);
 
     Serial.println("LSM303D initialized");
     Serial.println("Range: +/- 4g");
@@ -457,6 +535,12 @@ void readSensors() {
 
     display.drawString(
         0,
+        42,
+        "Vib windows: " + String(vibWindowsSent)
+    );
+
+    display.drawString(
+        0,
         52,
         deviceConnected ? "BLE: Connected" : "BLE: Waiting"
     );
@@ -488,6 +572,201 @@ void readSensors() {
         Serial.print("BLE sent: ");
         Serial.println(message);
     }
+}
+
+
+// =====================================================
+// VIBRATION CAPTURE (LSM303D FIFO)
+// =====================================================
+
+// Records VIB_WINDOW_SAMPLES readings into vibBuffer using the sensor's 32-sample
+// FIFO, so readings keep their exact 1600 Hz spacing even if the ESP32 is briefly
+// busy. Also measures the sensor's real output rate (it can be a few % off).
+bool captureWindow(uint32_t* firstSampleMs, float* measuredRateHz) {
+
+    // Reset the FIFO: bypass clears it, stream mode starts collecting.
+    if (!writeRegister(LSM303D_ADDRESS, LSM303D_FIFO_CTRL, 0x00) ||
+        !writeRegister(LSM303D_ADDRESS, LSM303D_CTRL0, 0x40) ||       // FIFO_EN
+        !writeRegister(LSM303D_ADDRESS, LSM303D_FIFO_CTRL, 0x40)) {   // stream mode
+        return false;
+    }
+
+    *firstSampleMs = millis();
+    uint32_t startUs = micros();
+    uint32_t timeoutUs = (uint32_t)(2.0f * VIB_WINDOW_SAMPLES / VIB_NOMINAL_RATE_HZ * 1e6f);
+
+    uint16_t collected = 0;
+    bool ok = true;
+
+    while (collected < VIB_WINDOW_SAMPLES) {
+
+        uint8_t src = readRegister(LSM303D_ADDRESS, LSM303D_FIFO_SRC);
+
+        if (src & 0x40) {
+            Serial.println("Vibration capture: FIFO overrun (readings lost)");
+            ok = false;
+            break;
+        }
+
+        uint8_t available = src & 0x1F;
+
+        if (available == 0 && !(src & 0x20)) {
+            available = 32;  // not empty with a count of 0 means completely full
+        }
+
+        for (uint8_t i = 0; i < available && collected < VIB_WINDOW_SAMPLES; i++) {
+
+            uint8_t b[6];
+
+            if (!readRegisters(LSM303D_ADDRESS, LSM303D_OUT_X_L, b, 6)) {
+                Serial.println("Vibration capture: I2C read failed");
+                ok = false;
+                break;
+            }
+
+            vibBuffer[collected][0] = (int16_t)((b[1] << 8) | b[0]);
+            vibBuffer[collected][1] = (int16_t)((b[3] << 8) | b[2]);
+            vibBuffer[collected][2] = (int16_t)((b[5] << 8) | b[4]);
+            collected++;
+        }
+
+        if (!ok) {
+            break;
+        }
+
+        if (micros() - startUs > timeoutUs) {
+            Serial.println("Vibration capture: timed out");
+            ok = false;
+            break;
+        }
+    }
+
+    // Readings still waiting in the FIFO were also produced during this time.
+    uint8_t pending = readRegister(LSM303D_ADDRESS, LSM303D_FIFO_SRC) & 0x1F;
+    uint32_t elapsedUs = micros() - startUs;
+
+    // Back to bypass so the 500 ms status readings see the latest value.
+    writeRegister(LSM303D_ADDRESS, LSM303D_FIFO_CTRL, 0x00);
+    writeRegister(LSM303D_ADDRESS, LSM303D_CTRL0, 0x00);
+
+    if (!ok) {
+        return false;
+    }
+
+    float rate = (collected + pending) / (elapsedUs / 1e6f);
+
+    if (rate < 0.9f * VIB_NOMINAL_RATE_HZ || rate > 1.1f * VIB_NOMINAL_RATE_HZ) {
+
+        Serial.print("Vibration capture: measured rate ");
+        Serial.print(rate, 1);
+        Serial.println(" Hz looks wrong; using nominal");
+
+        rate = VIB_NOMINAL_RATE_HZ;
+    }
+
+    *measuredRateHz = rate;
+
+    return true;
+}
+
+
+// =====================================================
+// VIBRATION TRANSMISSION
+// =====================================================
+
+bool vibrationReady() {
+
+    if (!accelerometerInitialized || !deviceConnected ||
+        vibCccd == nullptr || !vibCccd->getNotifications()) {
+        return false;  // no sensor, or the receiver hasn't subscribed
+    }
+
+    uint16_t mtu = bleServer->getPeerMTU(bleServer->getConnId());
+
+    if (mtu < smolbugs::MIN_MTU) {
+
+        // A smaller MTU would silently truncate frames, so don't send at all.
+        Serial.print("Vibration skipped: MTU ");
+        Serial.print(mtu);
+        Serial.print(" < ");
+        Serial.println(smolbugs::MIN_MTU);
+
+        return false;
+    }
+
+    return true;
+}
+
+
+void sendVibrationWindow() {
+
+    uint32_t firstSampleMs = 0;
+    float rateHz = VIB_NOMINAL_RATE_HZ;
+
+    if (!captureWindow(&firstSampleMs, &rateHz)) {
+        vibCaptureFailures++;
+        return;
+    }
+
+    uint8_t frame[smolbugs::MAX_DATA_FRAME_SIZE];
+
+    unsigned long started = millis();
+    uint32_t errorsBefore = vibNotifyErrors;
+
+    size_t len = smolbugs::encodeStart(
+        frame,
+        vibWindowId,
+        rateHz,
+        VIB_WINDOW_SAMPLES,
+        smolbugs::SAMPLES_PER_CHUNK,
+        VIB_RANGE_G,
+        VIB_LSB_PER_G,
+        firstSampleMs
+    );
+
+    vibCharacteristic->setValue(frame, len);
+    vibCharacteristic->notify();
+    delay(VIB_FRAME_GAP_MS);
+
+    uint16_t chunks = smolbugs::chunkCount(
+        VIB_WINDOW_SAMPLES,
+        smolbugs::SAMPLES_PER_CHUNK
+    );
+
+    for (uint16_t c = 0; c < chunks && deviceConnected; c++) {
+
+        uint32_t offset = (uint32_t)c * smolbugs::SAMPLES_PER_CHUNK;
+        uint32_t remaining = VIB_WINDOW_SAMPLES - offset;
+        size_t count = remaining < smolbugs::SAMPLES_PER_CHUNK
+            ? remaining
+            : smolbugs::SAMPLES_PER_CHUNK;
+
+        len = smolbugs::encodeData(
+            frame,
+            vibWindowId,
+            c,
+            &vibBuffer[offset],
+            count
+        );
+
+        vibCharacteristic->setValue(frame, len);
+        vibCharacteristic->notify();
+
+        delay(VIB_FRAME_GAP_MS);
+    }
+
+    vibWindowsSent++;
+
+    Serial.print("Vibration window ");
+    Serial.print(vibWindowId);
+    Serial.print(": ");
+    Serial.print(rateHz, 1);
+    Serial.print(" Hz, sent in ");
+    Serial.print(millis() - started);
+    Serial.print(" ms, notify errors: ");
+    Serial.println(vibNotifyErrors - errorsBefore);
+
+    vibWindowId++;  // uint16_t wraps at 65535, as the protocol expects
 }
 
 
@@ -589,5 +868,14 @@ void loop() {
         readSensors();
     }
 
-    delay(10);  
+    if (millis() - lastVibWindow >= VIB_INTERVAL_MS) {
+
+        lastVibWindow = millis();
+
+        if (vibrationReady()) {
+            sendVibrationWindow();
+        }
+    }
+
+    delay(10);
 }
