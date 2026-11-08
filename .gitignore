@@ -1,4 +1,10 @@
 __pycache__/
 *.pyc
+*.py[cod]
 data/
 models/
+
+# Virtual environments
+venv/
+.venv/
+
