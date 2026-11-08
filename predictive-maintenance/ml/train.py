@@ -1,10 +1,10 @@
 """Trains both models and reports how well they work on a session they never saw.
 
-    python -m ml.train --raw data/fake/raw        (fake data, works today)
-    python -m ml.train --raw data/raw             (your real recordings)
+    python -m ml.train --raw data/raw                 (vibration only)
+    python -m ml.train --raw data/raw --use-temp      (only once the thermistor is verified)
 
 Steps:
-1. Features for every 1 s window of every run (uses the team's FFT code).
+1. Features for every analysis window of every run (uses the team's FFT code).
 2. Each session is compared to its own normal_free runs ("learn normal" on install).
 3. Isolation forest learns what normal looks like (normal_free + normal_load only).
 4. Random forest learns which fault is which.
@@ -25,7 +25,7 @@ from .features import make_baseline, relative_features
 from .recordings import build_feature_table
 from .settings import BASELINE_LABEL, LABELS, NORMAL_LABELS
 
-META = ["session", "label", "run", "file", "window_start_s"]
+META = ["session", "label", "run", "file", "window_id", "window_start_s"]
 
 
 def add_relative(table: pd.DataFrame) -> pd.DataFrame:
@@ -49,16 +49,18 @@ def new_classifier():
     return RandomForestClassifier(n_estimators=300, class_weight="balanced", min_samples_leaf=2, random_state=0)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--raw", default="data/raw", help="folder of recordings like S1_imbalance_03.csv")
+    p.add_argument("--raw", default="data/raw", help="folder of run folders like S1_imbalance_03")
     p.add_argument("--out", default="models", help="where to save the model and reports")
     p.add_argument("--test-session", type=int, default=None, help="held-out session (default: the last one)")
-    args = p.parse_args()
+    p.add_argument("--use-temp", action="store_true",
+                   help="include temperature features (leave off until the thermistor is verified)")
+    args = p.parse_args(argv)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    table = build_feature_table(args.raw)
+    table = build_feature_table(args.raw, use_temp=args.use_temp)
     table.to_csv(out / "features_raw.csv", index=False)
     data = add_relative(table)
     data.to_csv(out / "features_relative.csv", index=False)
@@ -67,7 +69,12 @@ def main() -> None:
     pd.set_option("display.width", 200)
     pd.set_option("display.max_columns", 20)
     sessions = sorted(int(s) for s in data["session"].unique())
+    if len(sessions) < 2:
+        raise SystemExit(f"need at least 2 sessions with {BASELINE_LABEL} runs to test on an unseen one, "
+                         f"found {sessions}")
     test_session = args.test_session or sessions[-1]
+    if test_session not in sessions:
+        raise SystemExit(f"test session {test_session} not found; sessions are {sessions}")
     train, test = data[data["session"] != test_session], data[data["session"] == test_session]
     print(f"\ntrain sessions {[s for s in sessions if s != test_session]}, test session {test_session}")
     print(f"train {len(train)} windows, test {len(test)} windows")
@@ -108,6 +115,8 @@ def main() -> None:
         new_iforest().fit(data[data["label"].isin(NORMAL_LABELS)][feature_cols]),
         new_classifier().fit(data[feature_cols], data["label"]),
         feature_cols,
+        meta={"sessions": sessions, "uses_temperature": args.use_temp,
+              "windows": int(len(data)), "labels": sorted(data["label"].unique())},
     )
     final.save(out / "machineguard.joblib")
     print(f"\nsaved {out / 'machineguard.joblib'} (trained on all sessions)")
