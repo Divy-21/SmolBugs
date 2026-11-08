@@ -1,88 +1,87 @@
-# Hardware Plan
+# SmolBugs
 
-## Project Overview
+SmolBugs is a prototype for monitoring machine condition. An ESP32 reads temperature and vibration sensors, a Python gateway receives the readings over Bluetooth and analyses vibration windows, and a cloud service accepts readings for storage and inspection.
 
-This project is a prototype machine-condition monitoring system for
-detecting abnormal operating conditions associated with potential
-equipment failure. The prototype focuses on two measurable indicators:
+The repository also contains a separate MachineGuard machine-learning prototype for classifying drill conditions and tracking bearing wear. Its data collection and model workflow is documented separately from the Bluetooth gateway pipeline.
 
--   **Excessive vibration**, measured with an external accelerometer.
--   **Abnormal temperature rise**, measured with a contact thermistor.
+## System overview
 
-The system will collect sensor readings, calculate basic condition
-metrics, and provide local status feedback. It is intended to
-demonstrate early anomaly detection, not to diagnose a specific
-mechanical failure.
+```text
+Heltec ESP32 + sensors
+        │ Bluetooth Low Energy
+        ▼
+Python receiver ──► reassemble vibration window ──► FFT metrics
+        │                                              │
+        ├── save local session                         └──► cloud API
+        └── upload status and window results                  │
+                                                              ▼
+                                                       PostgreSQL
+```
 
-## Hardware
+The machine1 firmware sends thermistor status readings about twice per second and vibration windows in compact binary BLE packets. The receiver reconstructs each window, calculates frequency and severity metrics, and can save the session or queue uploads to the cloud. The cloud stores status packets and analysed windows and exposes API routes for reading them. The FFT output can help identify changes that merit investigation; it is not a diagnosis of a specific mechanical fault.
 
-  -----------------------------------------------------------------------
-  Component                           Role
-  ----------------------------------- -----------------------------------
-  **Heltec WiFi LoRa 32 V3            Main controller; reads sensors and
-  (ESP32-S3)**                        processes measurements
+The current firmware is configured for a Heltec ESP32, a Pololu MinIMU-9 v3 (LSM303D accelerometer), and an NTC thermistor. The vibration path currently has a synthetic test-signal option; check the firmware configuration and processing guide for hardware status and limitations before relying on measurements.
 
-  **Onboard 0.96-inch OLED**          Displays live readings and system
-                                      status or warnings
+## Repository layout
 
-  **Adafruit ICM-20948 IMU**          Supplies three-axis acceleration
-                                      data for vibration monitoring
+| Path | Contents |
+|---|---|
+| [`hardware scripts/machine1/`](hardware%20scripts/machine1/) | ESP32 machine1 firmware and shared BLE packet protocol header |
+| [`predictive-maintenance/processing/`](predictive-maintenance/processing/) | BLE protocol decoding, window assembly, FFT analysis, and thermistor conversion |
+| [`predictive-maintenance/ingest/`](predictive-maintenance/ingest/) | BLE receiver, session recording, and optional cloud uploader |
+| [`predictive-maintenance/simulation/`](predictive-maintenance/simulation/) | Synthetic vibration, BLE device, and packet simulators |
+| [`predictive-maintenance/ml/`](predictive-maintenance/ml/) | Separate MachineGuard recording, training, live-check, and wear-tracking tools |
+| [`predictive-maintenance/tests/`](predictive-maintenance/tests/) | Python and firmware protocol tests |
+| [`cloud/`](cloud/) | Next.js API service and Prisma/PostgreSQL schema |
+| [`docs/sending-data.md`](docs/sending-data.md) | Cloud packet formats and sender examples |
 
-  **NTC thermistor**                  Measures the temperature of the
-                                      monitored equipment or test surface
+## Run the Python receiver
 
-  **Fixed resistor**                  Forms a voltage divider with the
-                                      thermistor so the ESP32 can read
-                                      temperature through an ADC input
+From `predictive-maintenance/`, create and activate a virtual environment, then install the receiver dependencies:
 
-  **Breadboard, jumper wires and      Support prototype wiring and sensor
-  power connections**                 integration
-  -----------------------------------------------------------------------
+```bash
+python -m venv .venv
+# macOS/Linux:
+source .venv/bin/activate
+# Windows PowerShell:
+# .venv\Scripts\Activate.ps1
+python -m pip install numpy scipy plotly pytest bleak
+```
 
-The Heltec board does not have a built-in accelerometer, so the
-ICM-20948 is an external sensor. Its I²C interface will be used to
-communicate with the ESP32. The OLED uses the board's onboard display
-connection.
+Run a simulated receiver session without hardware:
 
-## System Design
+```bash
+python -m ingest.ble_receiver --simulate
+```
 
-1.  The ICM-20948 samples acceleration along the X, Y and Z axes.
-2.  The firmware processes those samples to estimate vibration
-    magnitude, including an RMS vibration metric over a sampling window.
-3.  The thermistor and fixed resistor form a voltage divider. The ESP32
-    reads the divider voltage through an ADC input and converts it to an
-    estimated temperature using the thermistor's characteristics.
-4.  The ESP32 combines the vibration and temperature measurements to
-    determine whether the monitored equipment is operating within the
-    prototype's configured limits.
-5.  The OLED presents the current readings and a clear normal or warning
-    state.
+Connect to a BLE board, save a session, or generate an FFT report:
 
-Wi-Fi may be used to transmit readings to a dashboard if time permits.
-LoRa is available on the Heltec board but is not a core part of the
-current prototype.
+```bash
+python -m ingest.ble_receiver --rpm 3000 --out data/session1
+python -m ingest.fft_report data/session1 --rpm 3000
+```
 
-## Development and Validation
+For receiver options, BLE protocol details, and known measurement limitations, see [`predictive-maintenance/processing/README.md`](predictive-maintenance/processing/README.md). For the independent ML workflow, see [`predictive-maintenance/ml/README.md`](predictive-maintenance/ml/README.md).
 
-Sensors will be tested independently before full integration:
+## Run the cloud service
 
--   Verify the OLED and ESP32 startup.
--   Confirm I²C communication and stable acceleration readings from the
-    ICM-20948.
--   Validate the thermistor voltage-divider readings against known or
-    independently measured temperatures.
--   Integrate the sensors and check that readings update consistently.
--   Test the warning logic by introducing controlled vibration and
-    temperature changes.
+The cloud app requires Node.js 20 or later and Docker with Compose. Follow [`cloud/README.md`](cloud/README.md) for environment setup and database migrations. In brief:
 
-The thermistor's exact type and calibration parameters must be confirmed
-before relying on its temperature output. Thresholds will be established
-through prototype testing rather than treated as universal equipment
-limits.
+```bash
+cd cloud
+npm install
+cp .env.example .env
+npm run db:up
+npm run db:migrate
+npm run dev
+```
+
+The local service listens at `http://localhost:3100`. Use `npm run fake-device` in another terminal to send simulated packets. API routes, authentication, and packet schemas are documented in the cloud guide and [`docs/sending-data.md`](docs/sending-data.md).
+
+## Machine-learning prototype
+
+The `ml` package is a separate drill monitoring workflow. It can generate fake recorder-format data, train models, replay sessions through the detector, and evaluate gradual bearing wear. Start with [`predictive-maintenance/ml/README.md`](predictive-maintenance/ml/README.md); its data and model files are generated locally and are not checked into the repository.
 
 ## Scope
 
-The competition prototype will demonstrate sensor acquisition, basic
-signal processing, and threshold-based anomaly alerts. It will not claim
-predictive maintenance accuracy, identify every failure mode, or replace
-industrial condition-monitoring equipment.
+This is a prototype for demonstrating sensor acquisition, signal processing, anomaly detection experiments, and data transport. Sensor calibration, machine-specific baselines, fault labels, and operating thresholds need validation on the target equipment before operational use.
