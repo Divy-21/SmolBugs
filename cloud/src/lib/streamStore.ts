@@ -14,8 +14,25 @@ export function streamBuffer(): StreamBuffer {
     buffer.start();
     flushOnShutdown(buffer);
     g.smolbugsStream = buffer;
+    void closeStaleAlerts(new Date());
   }
   return g.smolbugsStream;
+}
+
+// Whether an alert is open lives in this process's memory (StreamBuffer), and a new process starts
+// with none open. An alert a previous process left open could then never close: the dashboard would
+// show the machine as Critical for good. So on start, close those; a machine still outside its
+// limits opens a fresh alert within 3 packets. Only alerts created before this process started.
+async function closeStaleAlerts(startedAt: Date): Promise<void> {
+  try {
+    const { count } = await db().alert.updateMany({
+      where: { resolvedAt: null, createdAt: { lt: startedAt } },
+      data: { resolvedAt: startedAt },
+    });
+    if (count > 0) console.log(`Closed ${count} alert(s) left open by the previous server process`);
+  } catch (err) {
+    console.error(`Couldn't close stale alerts: ${(err as Error).message}`);
+  }
 }
 
 // One transaction per write: either the whole batch lands or none of it does.

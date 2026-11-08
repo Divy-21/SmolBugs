@@ -1,6 +1,6 @@
 // Pretends to be a machine, so the dashboard can be built without hardware.
 //
-//   npm run fake-device                        -> local dev server, machine MG-001
+//   npm run fake-device                        -> local dev server, machine SIM-DEV
 //   CLOUD_URL=https://... DEVICE_KEY=... MACHINE_ID=MG-002 npm run fake-device
 //
 // Every 500 ms: a status packet in Kelvin's format, thermistor voltage drifting.
@@ -13,7 +13,7 @@ import { readFileSync } from "node:fs";
 
 const url = process.env.CLOUD_URL ?? "http://localhost:3100";
 const key = process.env.DEVICE_KEY ?? "dev-key-change-me";
-const machineId = process.env.MACHINE_ID ?? "MG-001";
+const machineId = process.env.MACHINE_ID ?? "SIM-DEV";
 
 type Window = Record<string, unknown> & { window_id: number };
 const fixtures = JSON.parse(
