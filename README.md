@@ -1,19 +1,23 @@
 # MachineGuard by SmolBugs
 
-**A clip-on monitor that listens to a machine's vibration and temperature, tells you when something is wrong, and names the likely fault before the machine breaks.**
+**A clip-on monitor that learns what a machine is like when it's healthy, and alerts your phone when its vibration or temperature drifts away from that, before the machine breaks.**
 
 natHacks 2026, Standard Division, Construction and Manufacturing theme.
 
+**Live dashboard:** https://sm-db6bb08ece0d477c9e820f118f7e670c.ecs.ca-central-1.on.aws (the real drill is `MG-001`; it shows *No signal* when the sensor isn't running)
+
+![How MachineGuard works: sensor, Bluetooth, laptop analysis with a trained model, cloud decision, dashboard and phone alert](docs/system-flow.png)
+
 ## The problem
 
-Small shops run drills, saws and lathes until they fail. In Canada, 19% of businesses still run machines to failure, and the average unplanned outage costs about $242,000 an hour (ABB "Value of Reliability" survey, 2023). Large plants pay for condition monitoring. Small shops and makerspaces cannot, so they find out when the tool stops, the part is ruined or someone gets hurt.
+Small shops run drills, saws and lathes until they fail: in Canada, 19% of businesses say they run equipment until it fails (ABB "Value of Reliability" survey, 2023). Condition monitoring exists, but it's sold to large plants with reliability engineers (for example Nanoprecise, Augury and SKF). A shop with no maintenance team finds out when the tool stops, the part is ruined or someone gets hurt.
 
 ## What MachineGuard does
 
 1. A sensor node clips onto the machine and measures vibration (about 1,600 samples per second) and temperature.
 2. It sends full vibration windows over Bluetooth to a gateway laptop.
-3. The gateway runs an FFT on each window, and a machine learning model compares it to that machine's healthy baseline. It flags abnormal behaviour, names the likely fault (for example imbalance, a bent bit or a loose bit) and gives a recommended fix.
-4. Everything is stored in the cloud and shown on a live dashboard: each machine is online, idle, offline or broken, with temperature and vibration trends, an event history and phone alerts.
+3. The gateway runs an FFT on each window (vibration level in mm/s and its main frequency), and a trained model compares the window with that machine's own healthy baseline, learned in the first ~30 s after the sensor is clipped on.
+4. The cloud decides whether the machine is off, running normally or vibrating far above normal, stores everything, and shows it on a live dashboard. When a machine goes abnormal, the dashboard turns red with a suggested check and a **phone alert** goes out; when it recovers, a second alert says so.
 
 ```text
 Heltec ESP32 + LSM303D accelerometer + thermistor (on the machine)
@@ -33,9 +37,26 @@ The machine1 firmware sends thermistor status readings about twice per second an
 
 | What | Where |
 |---|---|
-| Slides | `docs/MachineGuard_Pitch.pdf` |
-| Next version concept renders (3D) | `docs/renders/` |
+| Live dashboard | https://sm-db6bb08ece0d477c9e820f118f7e670c.ecs.ca-central-1.on.aws |
+| System diagram | [`docs/system-flow.png`](docs/system-flow.png) ([SVG](docs/system-flow.svg)) |
+| Cloud packet formats | [`docs/sending-data.md`](docs/sending-data.md) |
 | Repository | https://github.com/Divy-21/SmolBugs |
+
+## Quick start: the real drill, end to end
+
+On the gateway laptop, with the board powered and Bluetooth on (and **Bluetooth mice and headphones off**, see Troubleshooting):
+
+```bash
+python "hardware scripts/machine1/receiver.py"
+```
+
+The first time, it asks for the device key (the team shares it privately) and saves it in `smolbugs.env`, which git ignores. Then:
+
+1. Run the drill normally, with no load, for about 40 s. The terminal shows `model: Learning this drill's normal (1 of 3)` up to `Learned`.
+2. Open the live dashboard and click the drill (`MG-001`): it shows **Running**, the vibration in mm/s, and the model's answer.
+3. Put a fault on the machine (for example a washer on the chuck) for 30 s: the tile turns red and the phone alert goes out. Remove it and run normally for 30 s: the alert closes.
+
+Options: `--simulate` (fake board, uploads as `MG-SIM`), `--no-cloud`, `--relearn` (after moving the sensor), `--no-model`, `--duration 60`.
 
 ## Hardware requirements
 
@@ -88,7 +109,7 @@ source .venv/bin/activate
 # Windows PowerShell:
 # .venv\Scripts\Activate.ps1
 # (if you get "running scripts is disabled", run: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass)
-python -m pip install numpy scipy plotly pytest bleak scikit-learn joblib
+python -m pip install numpy scipy pandas plotly pytest bleak scikit-learn==1.9.1 joblib
 ```
 
 ### Run the receiver
@@ -190,6 +211,8 @@ python -m ml.bearing_validation analyze
 
 The chart is saved to `reports/bearing_wear_warning.png`. Data and model files are generated locally and are not checked into the repository. Full details: [`predictive-maintenance/ml/README.md`](predictive-maintenance/ml/README.md).
 
+**Live, in the receiver** ([`ingest/live_model.py`](predictive-maintenance/ingest/live_model.py)): when `models/machineguard.joblib` is on the gateway laptop, the receiver runs it on every vibration window. It learns the machine's normal from the first 3 windows of the motor running (it skips windows where the machine is off or being moved by hand), saves that baseline so a restart reuses it, judges the 7 analysis windows in each clip and sends the majority answer to the cloud with the window. The dashboard shows it ("Model: Running normally, 63% sure"). Phone alerts don't depend on the model: it was trained on one session, so it informs, and the measured vibration decides.
+
 ## 4. Cloud and dashboard
 
 Requires Node.js 20 or later and Docker Desktop (running). Follow [`cloud/README.md`](cloud/README.md) for full details. In brief:
@@ -216,7 +239,17 @@ Look at the stored data with `npm run db:studio`, or `curl localhost:3100/api/v1
 
 **Dashboard** (`http://localhost:3100`): every machine is **Online**, **Idle** or **Offline** based on what the database has stored, and machines with an open alert are listed as **Broken** at the top. The selected machine shows temperature and vibration with limit lines, a 10-minute temperature trend, the latest FFT window, the alert history, and a monitoring panel (last reading, sensor health, readings waiting to be stored).
 
-**Alerts:** 3 abnormal packets in a row open an alert and 6 normal ones close it. Set `NTFY_TOPIC` to push alerts to a phone through [ntfy](https://ntfy.sh). Limits are environment variables (`TEMP_MAX_C`, `VIBRATION_STD_MAX_G`, and others), and `MG-001` (the real drill) has its own limits because a running drill shakes far more than an idle machine.
+**Drill states** (from each vibration window, [`cloud/src/lib/runState.ts`](cloud/src/lib/runState.ts)): **Off** below 1 mm/s, **Being moved** when the main frequency is below 15 Hz (a person handling it, not the motor), **Running**, and **Vibration far above normal** above 30 mm/s.
+
+**Alerts** ([`cloud/src/lib/stream.ts`](cloud/src/lib/stream.ts)):
+- Twice-a-second status readings: 3 abnormal in a row (shock, vibration spread, temperature) open an alert, 6 normal close it.
+- Vibration windows: 2 windows above 30 mm/s in a row open an alert, 2 normal close it.
+- A frozen accelerometer (the same reading 5 times in a row, for example a loose wire stuck at full scale) is reported as a **sensor fault**, not as vibration.
+- Every alert that opens or closes is pushed to phones through [ntfy](https://ntfy.sh) (`NTFY_TOPIC`, kept in AWS Secrets Manager).
+
+Limits are environment variables (`TEMP_MAX_C`, `VIBRATION_STD_MAX_G`, and others), and `MG-001` (the real drill) has its own limits because a running drill shakes far more than an idle machine.
+
+**Hosting:** the cloud runs on AWS (Amazon ECS Express Mode on Fargate, RDS PostgreSQL in a private subnet, image in ECR); [`cloud/deploy/aws-deploy.sh`](cloud/deploy/aws-deploy.sh) builds and deploys it. The device key and the ntfy topic live in AWS Secrets Manager, never in the repository.
 
 API routes, authentication and packet formats are documented in [`cloud/README.md`](cloud/README.md) and [`docs/sending-data.md`](docs/sending-data.md).
 
@@ -234,23 +267,45 @@ The FFT tests feed in signals with known answers (for example "0.5 g at exactly 
 
 ## Results
 
-- Working prototype mounted on a real drill, streaming 1,600 Hz vibration windows and temperature end to end into the cloud dashboard.
-- FFT pipeline verified against known test signals.
-- Machine learning pipeline (record, train on held-out sessions, live check) running on recorded drill data, with recommendations for each fault.
-- Bearing wear tracker on the public run-to-failure dataset: sustained wear warning 86 hours before failure.
+All from the real drill (`MG-001`) during the event, except the bearing test.
+
+- **End to end on real hardware:** sensor → Bluetooth → laptop (FFT + model) → AWS → dashboard → phone alert, then the alert closing by itself (Mon Nov 9, about 2 AM).
+- **The drill's vibration levels:** off 0.6–0.8 mm/s; moved by hand 1–5 mm/s at 2–4 Hz; running normally 8–15 mm/s (up to about 24 mm/s after the sensor was re-mounted); an off-balance fault 82–88 mm/s. The alert line sits at 30 mm/s.
+- **Each machine needs its own normal:** on Saturday's run, the generic limits flagged 62 of 150 normal drill readings as abnormal; the drill's own limits flagged none (those limits were fitted to that run).
+- **Sensor faults are caught:** a loose accelerometer wire (readings frozen at ±4 g) showed on the dashboard as a sensor fault, not as a broken machine.
+- **Model:** about 97% correct (449 of 462 windows) on the last runs of the recording session, which it didn't train on. They come from the same session, so this is optimistic. Live on the drill, it learned normal and told running from off.
+- **FFT pipeline** verified against known test signals (frequency within 0.01 Hz, amplitude within 0.5%).
+- **Bearing wear tracker** on the public run-to-failure dataset: sustained wear warning 86 hours before failure (one dataset, one test).
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `accel -3.997 3.997 -3.997 g` on every line, no vibration windows | The accelerometer isn't answering (usually a loose wire). Power the board off completely, reseat the four accelerometer wires, power on. A real restart shows `Temp  #    1`. |
+| `incomplete windows dropped` in the summary, no `Vib window` lines | Bluetooth is losing packets. Turn off Bluetooth mice and headphones on the gateway laptop: they share the radio. |
+| `Bluetooth error: No module named 'bleak'` | `python -m pip install bleak` |
+| The model says "Unusual vibration" while the machine runs normally | It learned a bad baseline: restart the receiver with `--relearn` and run the machine normally for 40 s. |
+| `Board not found` | Bluetooth allows one connection at a time: close the receiver on other laptops. |
 
 ## Limitations and next steps
 
 - Thresholds and fault labels come from one drill over one weekend. Each new machine needs its own healthy baseline recording.
 - The accelerometer is not calibrated, so vibration is compared to the machine's own baseline rather than an absolute standard.
 - The thermistor part values are assumptions until confirmed from its datasheet, so temperature is off in the ML model by default.
+- The model knows four states (off, normal, normal under load, loose bit) from one recording session; other faults show as "Unusual vibration, type unknown". It runs on the gateway laptop, where the trained file is.
+- The board records a 2.56 s clip every 10 s, so the vibration level updates every 10 s and a burst shorter than that can fall between clips.
 - The LSM303D captures vibration accurately up to about 360 Hz, so high-frequency bearing impacts need a faster sensor.
 - Next: one small custom board (a hub with a screen and battery, sensors on short cables) that clips onto any machine, then pilots with local shops and makerspaces.
 
 ## Credits and sources
 
-- Built by team SmolBugs: Divy, Kelvin, Manraj, Rimsha and Xavion.
-- Libraries: Arduino ESP32 core, NumPy, SciPy, scikit-learn, joblib, Plotly, Bleak, pytest, Next.js, React, Prisma, PostgreSQL, node-postgres, zod, Tailwind CSS, tsx, ntfy (phone alerts).
+- Built by team SmolBugs:
+  - **Kelvin**: hardware (device build, wiring, sensors, thermistor circuit), base firmware, hardware test scripts.
+  - **Xavion**: signal processing (FFT pipeline), the Bluetooth vibration protocol and capture-then-send firmware, the receiver, the simulators, recording the drill and training the model.
+  - **Rimsha**: ML pipeline (features, detector, training), the bearing wear tracker and its run-to-failure validation.
+  - **Divy**: dashboard, API routes and the core of the alert engine.
+  - **Manraj**: cloud backend and AWS (database, ingest API, deployment), phone alerts, drill-specific alert logic, the live model in the receiver, and integrating the pieces end to end.
+- Libraries and services: Arduino ESP32 core, NumPy, SciPy, pandas, scikit-learn, joblib, Plotly, Bleak, pytest, Next.js, React, Prisma, PostgreSQL, node-postgres, zod, Tailwind CSS, tsx, ntfy (phone alerts), Amazon Web Services (ECS, RDS, ECR, Secrets Manager).
 - Statistics: ABB "Value of Reliability" survey (July 2023), Canadian results, via Electrical Business.
 - Bearing data: Ball Bearing Run-to-Failure dataset (Kaggle, Jung et al. 2023).
 - All code in this repository was written during natHacks 2026 (November 6 to 9, 2026).
