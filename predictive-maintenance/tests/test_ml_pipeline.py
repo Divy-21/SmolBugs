@@ -223,6 +223,13 @@ def test_record_names_folder_and_calls_receiver(tmp_path):
     argv = calls[0]
     assert argv[argv.index("--out") + 1] == str(tmp_path / "S1_imbalance_03")
     assert argv[argv.index("--duration") + 1] == "100.0"
+    assert argv[argv.index("--rpm") + 1] == "1200.0"  # the drill, unless --rpm says otherwise
+    assert "--cloud" not in argv  # upload only when asked
+
+    calls.clear()
+    record.main(["--session", "1", "--label", "imbalance", "--seconds", "100", "--out", str(tmp_path),
+                 "--countdown", "0", "--cloud", "--rpm", "1500"], receiver_main=fake_receiver)
+    assert "--cloud" in calls[0] and calls[0][calls[0].index("--rpm") + 1] == "1500.0"
 
 
 def test_record_warns_when_no_vibration_arrives(tmp_path, capsys):

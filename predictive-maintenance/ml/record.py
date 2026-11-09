@@ -39,10 +39,13 @@ def run_folder(out: Path, session: int, label: str) -> Path:
     return out / f"S{session}_{label}_{next_run_number(out, session, label):02d}"
 
 
-def receiver_args(folder: Path, seconds: float, rpm: float | None, machine_id: str) -> list[str]:
+def receiver_args(folder: Path, seconds: float, rpm: float | None, machine_id: str,
+                  cloud: bool = False) -> list[str]:
     args = ["--out", str(folder), "--duration", str(seconds), "--machine-id", machine_id]
     if rpm:
         args += ["--rpm", str(rpm)]
+    if cloud:
+        args.append("--cloud")  # also upload live: device key from DEVICE_KEY or smolbugs.env
     return args
 
 
@@ -71,10 +74,13 @@ def main(argv: list[str] | None = None, receiver_main=None) -> int:
     p.add_argument("--session", type=int, required=True, help="one sensor mounting; re-clip between sessions")
     p.add_argument("--label", choices=LABELS, required=True)
     p.add_argument("--seconds", type=float, default=300.0)
-    p.add_argument("--rpm", type=float, help="optional; only used for the receiver's live log")
+    p.add_argument("--rpm", type=float, default=1200.0,
+                   help="chuck speed; the drill runs at 1200 rpm (20 Hz; its motor shows at 60 Hz = 3x)")
     p.add_argument("--machine-id", default="MG-001")
     p.add_argument("--out", default="data/raw")
     p.add_argument("--countdown", type=int, default=3, help="seconds to get ready before recording")
+    p.add_argument("--cloud", action="store_true",
+                   help="also upload to the SmolBugs cloud while recording (dashboard + phone alerts)")
     args = p.parse_args(argv)
     if args.seconds < MIN_WINDOWS * WINDOW_PERIOD_S:
         p.error(f"--seconds must be at least {MIN_WINDOWS * WINDOW_PERIOD_S:.0f}")
@@ -88,7 +94,7 @@ def main(argv: list[str] | None = None, receiver_main=None) -> int:
 
     if receiver_main is None:
         from ingest.ble_receiver import main as receiver_main
-    receiver_main(receiver_args(folder, args.seconds, args.rpm, args.machine_id))
+    receiver_main(receiver_args(folder, args.seconds, args.rpm, args.machine_id, args.cloud))
 
     problems = check_run(folder, args.seconds)
     if problems:

@@ -15,7 +15,7 @@ What the shortcut adds:
   - --simulate (fake board) uploads as MG-SIM, never as the real MG-001.
   - --no-cloud: print and save only.
 
-Any other option is passed through, e.g. --rpm 3000, --duration 60, --machine-id MG-002.
+--rpm defaults to 1200 (the drill). Any other option is passed through, e.g. --duration 60, --machine-id MG-002.
 """
 
 import getpass
@@ -49,6 +49,8 @@ def build_args(argv: list[str]) -> list[str]:
     no_cloud = "--no-cloud" in args
     args = [a for a in args if a != "--no-cloud"]
 
+    if "--rpm" not in args:
+        args += ["--rpm", "1200"]  # the drill: 1200 rpm at the chuck (20 Hz); the motor shows at 60 Hz (3x)
     if "--simulate" in args and "--machine-id" not in args:
         args += ["--machine-id", "MG-SIM"]  # fake data must never land on the real machine
     if "--out" not in args:
