@@ -1,6 +1,6 @@
 # MachineGuard by SmolBugs
 
-**A clip-on monitor that learns what a machine is like when it's healthy, and alerts your phone when its vibration or temperature drifts away from that, before the machine breaks.**
+**An easy to install monitor that learns what a machine is like when it's healthy, and alerts your phone when its vibration or temperature drifts away from that, before the machine breaks.**
 
 natHacks 2026, Standard Division, Construction and Manufacturing theme.
 
