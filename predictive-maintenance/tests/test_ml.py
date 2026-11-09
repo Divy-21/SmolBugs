@@ -4,8 +4,7 @@ import pytest
 
 from ml.fake_recordings import fake_run
 from ml.features import relative_features, time_features, window_features
-from ml.record import parse_line
-from ml.recordings import check_timing, parse_name
+from ml.recordings import parse_name
 from ml.settings import FS, WINDOW
 
 
@@ -38,15 +37,10 @@ def test_imbalance_shows_up_in_1x():
     assert relative_features(imb, base.iloc[0])["x_h1x_rel"].iloc[0] > 1.5
 
 
-def test_file_names_and_lines():
+def test_run_folder_names():
     from pathlib import Path
-    assert parse_name(Path("S2_bent_bit_04.csv")) == {"session": 2, "label": "bent_bit", "run": 4, "file": "S2_bent_bit_04.csv"}
+    assert parse_name(Path("S2_bent_bit_04")) == {"session": 2, "label": "bent_bit", "run": 4, "file": "S2_bent_bit_04"}
     with pytest.raises(ValueError):
-        parse_name(Path("S1_wobbly_01.csv"))
-    assert parse_line(b"1000,0.1,0.2,1.0,24.5\r\n") == [1000, 0.1, 0.2, 1.0, 24.5]
-    assert parse_line(b"rst:0x1 (POWERON_RESET)\n") is None
-
-
-def test_dropped_samples_are_counted():
-    t = np.delete(np.arange(1000) * 1000, [100, 101, 500])
-    assert check_timing(t)["dropped"] == 3
+        parse_name(Path("S1_wobbly_01"))
+    with pytest.raises(ValueError):
+        parse_name(Path("bent_bit"))
