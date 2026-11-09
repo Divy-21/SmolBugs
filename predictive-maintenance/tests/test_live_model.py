@@ -55,8 +55,11 @@ def model(tmp_path, **kw):
 def test_learns_from_running_windows_only_then_judges(tmp_path):
     m = model(tmp_path)
     assert m.check(window(), FS, velocity_mm_s=0.5)["state"] == "learning"  # off: not learned from
+    out = m.check(window(), FS, velocity_mm_s=4.8, main_freq_hz=4.0)  # moved by hand (real, Nov 9)
+    assert "(0 of" in out["message"]
+    assert "(0 of" in m.check(window(), FS, velocity_mm_s=9, main_freq_hz=3.0)["message"]  # shaken hard by hand
     for i in range(LEARN_WINDOWS - 1):
-        out = m.check(window(), FS, velocity_mm_s=10)
+        out = m.check(window(), FS, velocity_mm_s=10, main_freq_hz=135.0)
         assert out["state"] == "learning" and f"({i + 1} of {LEARN_WINDOWS})" in out["message"]
     assert m.check(window(), FS, 10)["message"] == "Learned this drill's normal"
     assert m.det.calibrated_with == LEARN_WINDOWS * 7  # 7 analysis windows per Bluetooth window
@@ -117,7 +120,7 @@ def test_missing_model_file_means_no_model(tmp_path):
 def test_receiver_adds_the_answer_and_survives_a_model_error(tmp_path):
     handler = MachineGuardHandler("MG-T", log=lambda _: None, model=model(tmp_path))
     w = SimpleNamespace(accel_g=window(), sample_rate_hz=FS)
-    result = {"axes": {ax: {"velocity_rms_mm_s": 10.0} for ax in "xyz"}}
+    result = {"axes": {ax: {"velocity_rms_mm_s": 10.0, "dominant_amp_g": 0.1, "dominant_freq_hz": 135.0} for ax in "xyz"}}
     assert handler._run_model(w, result)["state"] == "learning"
 
     def boom(*_):

@@ -27,7 +27,11 @@ import numpy as np
 
 DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "models" / "machineguard.joblib"
 LEARN_WINDOWS = 3          # Bluetooth windows of normal running (about 30 s)
-RUNNING_ABOVE_MM_S = 1.0   # below this the drill is off; same line as the cloud (cloud/src/lib/runState.ts)
+# Learn only from windows that are clearly the motor running: real drill, Mon Nov 9, the first live
+# run learned from a window at 4.8 mm/s / 4 Hz, which was the drill being moved by hand. Off is
+# 0.6-0.8 mm/s, moved by hand 1-5 mm/s at 2-4 Hz, running 8-22 mm/s at 67-200 Hz.
+LEARN_ABOVE_MM_S = 6.0
+LEARN_ABOVE_HZ = 15.0      # same line as the cloud's "being moved" (cloud/src/lib/runState.ts)
 # The model was trained on one session and has never seen strong vibration: outside what it knows,
 # its classifier sometimes answers "off" (at ~35% confidence) for a drill shaking at 17-210 mm/s.
 # When it says off but the FFT measures clearly-running vibration (real drill: off 0.6-0.8 mm/s,
@@ -106,7 +110,8 @@ class LiveModel:
             self.log(f"Model: couldn't save the normal ({err}); it will be learned again next start.")
 
     # ---------- every window ----------
-    def check(self, accel_g: np.ndarray, fs: float, velocity_mm_s: float) -> dict[str, Any] | None:
+    def check(self, accel_g: np.ndarray, fs: float, velocity_mm_s: float,
+              main_freq_hz: float | None = None) -> dict[str, Any] | None:
         """The model's answer for one Bluetooth window, or None if this window can't be judged."""
         if abs(fs - self._fs) > self._fs_tolerance * self._fs:
             return None  # the model was trained at 1600 Hz; anything else would be guesswork
@@ -115,7 +120,8 @@ class LiveModel:
             return None
 
         if not self.ready:
-            if velocity_mm_s >= RUNNING_ABOVE_MM_S:  # learn from running, never from a switched-off drill
+            motor = main_freq_hz is None or main_freq_hz >= LEARN_ABOVE_HZ
+            if velocity_mm_s >= LEARN_ABOVE_MM_S and motor:  # never off, never moved by hand
                 self._learning.extend(pieces)
                 self._learned_from += 1
             if self._learned_from < LEARN_WINDOWS:

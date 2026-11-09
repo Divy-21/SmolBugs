@@ -251,9 +251,11 @@ class MachineGuardHandler:
         rest of the run; it never stops the receiver."""
         if self.model is None or self._model_failed:
             return None
-        velocity = max(a["velocity_rms_mm_s"] for a in result["axes"].values())
+        axes = list(result["axes"].values())
+        velocity = max(a["velocity_rms_mm_s"] for a in axes)
+        main_freq = max(axes, key=lambda a: a["dominant_amp_g"])["dominant_freq_hz"]  # as the cloud picks it
         try:
-            ml = self.model.check(window.accel_g, window.sample_rate_hz, velocity)
+            ml = self.model.check(window.accel_g, window.sample_rate_hz, velocity, main_freq)
         except Exception as err:
             self._model_failed = True
             self.log(f"      model error, turning the model off for this run: {err!r}")
