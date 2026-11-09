@@ -36,12 +36,22 @@ window if any, the alert history, and a data-quality panel (last reading, sensor
 be stored, last database write). "No signal" means readings stopped arriving, which is different from a healthy
 machine.
 
+**Machine status.** Every machine shows one of three statuses, worked out from what the database has stored
+(`GET /api/v1/activity`, rules in `src/lib/activity.ts`): **Online** (readings arriving and the machine is moving),
+**Idle** (readings arriving, but the accelerometer spread over the last 20 readings is under 0.05 g, so it isn't
+running), **Offline** (nothing stored for 15 s). Change the cutoffs with `IDLE_SPREAD_MAX_G` and `OFFLINE_AFTER_S`.
+Machines with an alert still open are **broken** and are also listed in their own section at the top of the page.
+Times come from the gateway laptop's clock, so keep it in sync with the server's.
+
 The live tiles come from `GET /api/v1/live` (memory, updated every packet); the 10-minute trend and the history
 come from the database, so they lag by a few seconds.
 
-To demo without hardware, run `npm run fake-fleet`: four simulated machines (drill press, band saw, lathe, air
-compressor) as `SIM-001`…`SIM-004`, so they never mix with the real board's `MG-001`. Press `1`-`4` to start or stop a fault on one (shaking and overheating; it cools down afterwards) and
-`q` `w` `e` `r` to cut or restore its signal. `npm run fake-device` is a single machine (`f` toggles the fault).
+To demo without hardware, run `npm run fake-fleet`: six simulated machines (`SIM-001`…`SIM-006`, never mixed with
+the real board's `MG-001`) that start in different states, so every status is on screen within about 20 s: two
+online, a band saw that breaks (abnormal vibration), an idle lathe, an air compressor that goes offline, and a
+grinder whose accelerometer is dead (broken: sensor not responding). Keys, one column per machine: `1`-`6` fault,
+`q`-`y` signal loss, `a`-`h` idle, `z`-`n` dead accelerometer. `npm run fake-fleet -- --all-running` starts them all
+healthy. `npm run fake-device` is a single machine (`f` toggles the fault).
 All of this data is simulated: say so when presenting it.
 
 ## API
@@ -60,6 +70,7 @@ array of up to 100. Extra fields are allowed and kept: every row stores the pack
 | `GET /api/v1/live` | Last ~70 s of status packets per machine from memory, plus the limits in use (the dashboard's live view) |
 | `GET /api/v1/alerts?machine_id=&limit=50` | Alerts, newest first |
 | `PUT /api/v1/machines/{id}` | Register a machine or set its `name`, `kind`, `rpm` (needs `x-device-key`) |
+| `GET /api/v1/activity` | Each machine's status from the database (online, idle or offline) and whether it's broken (an open alert) |
 | `GET /api/health` | `{"ok": true}`, for the load balancer; doesn't touch the database |
 
 Packets carrying a `packet_id` already in the database are skipped (unique index, `ON CONFLICT DO NOTHING`)

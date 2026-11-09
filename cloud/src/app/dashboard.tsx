@@ -6,6 +6,7 @@
 //   GET /api/v1/live      every 1 s   last ~70 s per machine, from memory (live view)
 //   GET /api/v1/machines  every 10 s  names, kinds, latest stored FFT window
 //   GET /api/v1/alerts    every 5 s   event history
+//   GET /api/v1/activity  every 3 s   online / idle / offline and broken, from the database
 //   GET /api/v1/machines/{id}/readings?minutes=10   every 15 s   10-minute trend (database)
 //
 // Health is worked out here from what the endpoint already decided (flags,
@@ -74,6 +75,24 @@ type AlertRow = {
   resolvedAt: string | null;
 };
 
+// From GET /api/v1/activity: what the DATABASE says about each machine.
+type ActivityState = "online" | "idle" | "offline";
+
+type Broken = { alert_id: number; since: string; severity: "alert" | "watch"; kind: string; message: string };
+
+type ActivityRow = {
+  machine_id: string;
+  state: ActivityState;
+  reason: string;
+  last_received_at: string | null;
+  age_ms: number | null;
+  readings_last_minute: number;
+  vibration_spread_g: number | null;
+  broken: Broken | null;
+};
+
+type ActivityResp = { checked_at: string; offline_after_ms: number; idle_spread_max_g: number; machines: ActivityRow[] };
+
 type StatusRow = { receivedAt: string; temperatureC: number | null };
 
 type Point = { t: number; v: number };
@@ -127,14 +146,25 @@ type Health = "critical" | "warning" | "healthy" | "offline" | "nodata";
 
 const STALE_MS = 10_000; // no packet for 10 s: the link is down, not the machine
 
-// Ordered most urgent first: the fleet list is sorted by this.
-const HEALTH: Record<Health, { rank: number; label: string; bar: string; text: string; dot: string }> = {
-  critical: { rank: 0, label: "Critical", bar: "bg-red-600", text: "text-red-700", dot: "bg-red-600" },
-  warning: { rank: 1, label: "Warning", bar: "bg-amber-500", text: "text-amber-700", dot: "bg-amber-500" },
-  offline: { rank: 2, label: "No signal", bar: "bg-slate-400", text: "text-slate-600", dot: "bg-slate-400" },
-  healthy: { rank: 3, label: "Healthy", bar: "bg-emerald-600", text: "text-emerald-700", dot: "bg-emerald-600" },
-  nodata: { rank: 4, label: "Waiting", bar: "bg-slate-200", text: "text-slate-500", dot: "bg-slate-300" },
+// Is the database receiving this machine's data? Online/idle/offline is the one
+// status every machine always has; "broken" is shown on top of it, in its own space.
+const STATE: Record<ActivityState, { rank: number; label: string; bar: string; text: string; dot: string }> = {
+  online: { rank: 0, label: "Online", bar: "bg-emerald-500", text: "text-emerald-700", dot: "bg-emerald-500" },
+  idle: { rank: 1, label: "Idle", bar: "bg-sky-400", text: "text-sky-700", dot: "bg-sky-400" },
+  offline: { rank: 2, label: "Offline", bar: "bg-slate-300", text: "text-slate-500", dot: "bg-slate-400" },
 };
+
+const BROKEN_TITLE: Record<string, string> = {
+  overheat: "Overheating",
+  vibration: "Abnormal vibration",
+  sensor_fault: "Sensor not responding",
+};
+
+function brokenDetail(b: Broken): string {
+  const flags = b.message.replace(/^Outside limits:\s*/, "").split(/,\s*/).filter(Boolean);
+  const words = flags.map((f) => FLAG_TEXT[f] ?? f);
+  return words.length ? capitalise(words.join(", ")) : b.message;
+}
 
 const FAULT_FLAGS = new Set(["thermistor_fault", "accel_fault"]);
 
@@ -152,6 +182,8 @@ const KIND_TEXT: Record<string, string> = {
   band_saw: "Band saw",
   lathe: "Lathe",
   compressor: "Compressor",
+  mill: "Milling machine",
+  grinder: "Grinder",
 };
 
 function kindText(info: MachineRow | null): string | null {
@@ -221,28 +253,40 @@ export default function Dashboard() {
   const live = usePoll<Live>("/api/v1/live", 1000);
   const machines = usePoll<{ machines: MachineRow[] }>("/api/v1/machines", 10_000);
   const alerts = usePoll<{ alerts: AlertRow[] }>("/api/v1/alerts?limit=100", 5000);
+  const activity = usePoll<ActivityResp>("/api/v1/activity", 3000);
   const [picked, setPicked] = useState<string | null>(null);
 
   const liveOf = (id: string) => live.data?.machines.find((m) => m.machine_id === id);
   const infoOf = (id: string) => machines.data?.machines.find((m) => m.id === id) ?? null;
   const alertsOf = (id: string) => (alerts.data?.alerts ?? []).filter((a) => a.machineId === id);
-  const openOf = (id: string) => alertsOf(id).filter((a) => a.resolvedAt === null);
+  const activityOf = (id: string) => activity.data?.machines.find((m) => m.machine_id === id) ?? null;
 
   // Every machine either source knows, most urgent first.
   const ids = useMemo(() => {
     const set = new Set<string>();
     for (const m of live.data?.machines ?? []) set.add(m.machine_id);
     for (const m of machines.data?.machines ?? []) set.add(m.id);
+    for (const m of activity.data?.machines ?? []) set.add(m.machine_id);
     return [...set];
-  }, [live.data, machines.data]);
-  const rows = ids
-    .map((id) => ({ id, health: healthOf(liveOf(id), openOf(id), now) }))
-    .sort((a, b) => HEALTH[a.health].rank - HEALTH[b.health].rank || a.id.localeCompare(b.id));
+  }, [live.data, machines.data, activity.data]);
+  // Broken first, then online, idle, offline.
+  const rows: FleetRow[] = ids
+    .map((id) => {
+      const a = activityOf(id);
+      return { id, state: a?.state ?? null, broken: a?.broken ?? null };
+    })
+    .sort(
+      (a, b) =>
+        Number(b.broken !== null) - Number(a.broken !== null) ||
+        (a.state ? STATE[a.state].rank : 3) - (b.state ? STATE[b.state].rank : 3) ||
+        a.id.localeCompare(b.id),
+    );
 
   const selected = picked && ids.includes(picked) ? picked : (rows[0]?.id ?? null);
-  const attention = rows.filter((r) => r.health === "critical" || r.health === "warning").length;
-  const silent = rows.filter((r) => r.health === "offline").length;
-  const apiDown = live.error !== null;
+  const count = (st: ActivityState) => rows.filter((r) => r.state === st).length;
+  const brokenCount = rows.filter((r) => r.broken).length;
+  const apiDown = live.error !== null && activity.error !== null;
+  const noStatus = activity.error ? "Unknown" : activity.data ? "Nothing stored" : "Checking";
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -251,22 +295,33 @@ export default function Dashboard() {
           <h1 className="text-[15px] font-semibold tracking-tight">SmolBugs</h1>
           <p className="text-sm text-slate-600">
             {rows.length === 0
-              ? "No machines reporting yet"
-              : attention > 0
-                ? `${attention} of ${rows.length} machines need attention`
-                : `All ${rows.length} machines within limits`}
-            {silent > 0 && `, ${silent} not reporting`}
+              ? "No machines registered yet"
+              : `${count("online")} online, ${count("idle")} idle, ${count("offline")} offline`}
+            {brokenCount > 0 && (
+              <span className="ml-2 font-medium text-red-700">
+                {brokenCount} broken
+              </span>
+            )}
           </p>
         </div>
       </header>
 
       {apiDown && (
         <p role="alert" className="border-b border-red-200 bg-red-50 px-6 py-2 text-center text-sm text-red-800">
-          Lost contact with the SmolBugs server ({live.error}). Showing the last data received.
+          Lost contact with the SmolBugs server ({activity.error}). Showing the last data received.
+        </p>
+      )}
+
+      {activity.error && !apiDown && (
+        <p role="alert" className="border-b border-amber-200 bg-amber-50 px-6 py-2 text-center text-sm text-amber-900">
+          Can&apos;t read machine status from the database (/api/v1/activity: {activity.error}). Check the terminal
+          running npm run dev for the error.
         </p>
       )}
 
       <div className="mx-auto max-w-7xl space-y-8 px-6 py-8">
+        {rows.length > 0 && <BrokenPanel rows={rows} infoOf={infoOf} activityOf={activityOf} onSelect={setPicked} now={now} />}
+
         <Fleet
           rows={rows}
           selected={selected}
@@ -274,6 +329,8 @@ export default function Dashboard() {
           now={now}
           liveOf={liveOf}
           infoOf={infoOf}
+          activityOf={activityOf}
+          noStatus={noStatus}
           limits={live.data?.limits ?? null}
         />
 
@@ -286,6 +343,8 @@ export default function Dashboard() {
             limits={liveOf(selected)?.limits ?? live.data?.limits ?? null}
             info={infoOf(selected)}
             alerts={alertsOf(selected)}
+            activity={activityOf(selected)}
+            noStatus={noStatus}
           />
         ) : (
           <p className="border border-dashed border-slate-300 bg-white px-6 py-12 text-center text-sm text-slate-500">
@@ -300,16 +359,81 @@ export default function Dashboard() {
 
 // ---------------------------------------------------------------- fleet table
 
+type FleetRow = { id: string; state: ActivityState | null; broken: Broken | null };
+
+// The space for broken machines: always on screen, so "nothing is broken" is visible too.
+function BrokenPanel(props: {
+  rows: FleetRow[];
+  infoOf: (id: string) => MachineRow | null;
+  activityOf: (id: string) => ActivityRow | null;
+  onSelect: (id: string) => void;
+  now: number;
+}) {
+  const broken = props.rows.filter((r) => r.broken !== null);
+  const many = broken.length > 1;
+  return (
+    <section
+      aria-labelledby="broken-heading"
+      className={broken.length ? "border border-red-300 bg-red-50" : "border border-slate-200 bg-white"}
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1 px-5 py-3">
+        <h2 id="broken-heading" className={`font-semibold ${broken.length ? "text-red-800" : ""}`}>
+          Broken
+        </h2>
+        <p className={`text-sm ${broken.length ? "text-red-800" : "text-slate-500"}`}>
+          {broken.length === 0
+            ? "No machines are broken."
+            : `${broken.length} ${many ? "machines need" : "machine needs"} inspection before the next run.`}
+        </p>
+      </div>
+      {broken.length > 0 && (
+        <ul className="border-t border-red-200">
+          {broken.map(({ id, state, broken: b }) => {
+            const info = props.infoOf(id);
+            const act = props.activityOf(id);
+            if (!b) return null;
+            return (
+              <li key={id} className="border-b border-red-200 last:border-b-0">
+                <button
+                  onClick={() => props.onSelect(id)}
+                  className="grid w-full grid-cols-1 items-baseline gap-x-6 gap-y-1 px-5 py-3 text-left hover:bg-red-100/60 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-red-800 md:grid-cols-[minmax(180px,1.4fr)_2fr_auto]"
+                >
+                  <span>
+                    <span className="block font-medium text-red-900">{info?.name ?? id}</span>
+                    <span className="block text-xs text-red-800/80">{id}</span>
+                  </span>
+                  <span className="text-sm text-red-900">
+                    <span className="font-medium">{BROKEN_TITLE[b.kind] ?? capitalise(b.kind.replace(/_/g, " "))}</span>
+                    {": "}
+                    {brokenDetail(b).toLowerCase()}
+                  </span>
+                  <span className="text-sm text-red-800/80 md:text-right">
+                    Since {clock(b.since)}
+                    {state && `, now ${STATE[state].label.toLowerCase()}`}
+                    {state === "offline" && act?.last_received_at ? ` (last data ${ago(props.now, act.last_received_at)} ago)` : ""}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 function Fleet(props: {
-  rows: { id: string; health: Health }[];
+  rows: FleetRow[];
   selected: string | null;
   onSelect: (id: string) => void;
   now: number;
   liveOf: (id: string) => LiveMachine | undefined;
   infoOf: (id: string) => MachineRow | null;
+  activityOf: (id: string) => ActivityRow | null;
+  noStatus: string;
   limits: Limits | null;
 }) {
-  const { rows, selected, onSelect, now, liveOf, infoOf, limits } = props;
+  const { rows, selected, onSelect, now, liveOf, infoOf, activityOf, noStatus, limits } = props;
   if (rows.length === 0) return null;
   const cols = "grid grid-cols-[1fr_auto] items-center gap-x-6 md:grid-cols-[minmax(180px,1.4fr)_120px_1fr_1fr_96px]";
 
@@ -320,14 +444,15 @@ function Fleet(props: {
       </h2>
       <div className={`${cols} border-b border-slate-200 px-5 py-2.5 text-xs text-slate-500 max-md:hidden`}>
         <span>Machine</span>
-        <span>Condition</span>
+        <span>Status</span>
         <span>Temperature</span>
         <span>Vibration</span>
-        <span className="text-right">Last reading</span>
+        <span className="text-right">Last stored</span>
       </div>
       <ul>
-        {rows.map(({ id, health }) => {
+        {rows.map(({ id, state, broken }) => {
           const live = liveOf(id);
+          const act = activityOf(id);
           const info = infoOf(id);
           const points = live?.recent ?? [];
           const last = points.at(-1);
@@ -344,7 +469,10 @@ function Fleet(props: {
                   isSel ? "bg-slate-50" : "hover:bg-slate-50/70"
                 }`}
               >
-                <span className={`absolute inset-y-0 left-0 w-1 ${HEALTH[health].bar}`} aria-hidden />
+                <span
+                  className={`absolute inset-y-0 left-0 w-1 ${broken ? "bg-red-600" : state ? STATE[state].bar : "bg-slate-200"}`}
+                  aria-hidden
+                />
                 <span className="min-w-0">
                   <span className="block truncate font-medium">{info?.name ?? id}</span>
                   <span className="block text-xs text-slate-500">
@@ -352,11 +480,17 @@ function Fleet(props: {
                     {kindText(info) ? `, ${kindText(info)}` : ""}
                   </span>
                 </span>
-                <span className={`text-sm font-medium ${HEALTH[health].text}`}>{HEALTH[health].label}</span>
+                <span className="text-sm">
+                  <span className={`flex items-center gap-1.5 font-medium ${state ? STATE[state].text : "text-slate-500"}`}>
+                    <span className={`h-2 w-2 rounded-full ${state ? STATE[state].dot : "bg-slate-300"}`} aria-hidden />
+                    {state ? STATE[state].label : noStatus}
+                  </span>
+                  {broken && <span className="block text-xs font-medium text-red-700">Broken</span>}
+                </span>
                 <Reading value={temp.at(-1)?.v} digits={1} unit="°C" points={temp} limit={lim?.temp_max_c ?? null} />
                 <Reading value={vib.at(-1)?.v} digits={3} unit="g" points={vib} limit={lim?.vibration_std_max_g ?? null} />
                 <span className="text-right text-sm tabular-nums text-slate-500 max-md:hidden">
-                  {last ? ago(now, last.t) : "never"}
+                  {act?.last_received_at ? `${ago(now, act.last_received_at)} ago` : last ? `${ago(now, last.t)} ago` : "never"}
                 </span>
               </button>
             </li>
@@ -388,12 +522,27 @@ function MachineView(props: {
   limits: Limits | null;
   info: MachineRow | null;
   alerts: AlertRow[];
+  activity: ActivityRow | null;
+  noStatus: string;
 }) {
-  const { id, now, live, limits, info, alerts } = props;
+  const { id, now, live, limits, info, alerts, activity, noStatus } = props;
   const open = alerts.filter((a) => a.resolvedAt === null);
   const points = live?.recent ?? [];
   const last = points.at(-1);
   const health = healthOf(live, open, now);
+  const state = activity?.state ?? null;
+  const broken = activity?.broken ?? null;
+  const headline = broken
+    ? `${BROKEN_TITLE[broken.kind] ?? capitalise(broken.kind.replace(/_/g, " "))}: ${brokenDetail(broken).toLowerCase()}. Inspect before the next run.`
+    : state === "offline"
+      ? `${activity?.reason ?? "No data"}. Check the sensor node and the gateway.`
+      : state === "idle"
+        ? "Connected and sending data, but the machine isn't running."
+        : state === "online"
+          ? health === "warning"
+            ? summary(health, last, open)
+            : "Running and sending data. All readings are within limits."
+          : "Checking the database for this machine's data.";
   const [range, setRange] = useState<"live" | "10m">("live");
 
   const history = usePoll<{ status: StatusRow[] }>(
@@ -414,7 +563,10 @@ function MachineView(props: {
       <div className="border border-slate-200 bg-white">
         {/* Condition: the one loud element on the page */}
         <div className="relative border-b border-slate-200 py-5 pr-6 pl-7">
-          <span className={`absolute inset-y-0 left-0 w-1.5 ${HEALTH[health].bar}`} aria-hidden />
+          <span
+            className={`absolute inset-y-0 left-0 w-1.5 ${broken ? "bg-red-600" : state ? STATE[state].bar : "bg-slate-200"}`}
+            aria-hidden
+          />
           <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
             <h2 id="machine-heading" className="text-xl font-semibold tracking-tight">
               {info?.name ?? id}
@@ -425,9 +577,14 @@ function MachineView(props: {
               {info?.rpm ? `, ${info.rpm.toLocaleString()} rpm` : ""}
             </p>
           </div>
-          <p className={`mt-3 text-3xl font-semibold tracking-tight ${HEALTH[health].text}`}>{HEALTH[health].label}</p>
-          <p className="mt-1 text-slate-700">{summary(health, last, open)}</p>
-          {open[0] && <p className="mt-1 text-sm text-slate-500">Alert open since {clock(open[0].createdAt)}</p>}
+          <p className="mt-3 flex flex-wrap items-baseline gap-x-4 text-3xl font-semibold tracking-tight">
+            {broken && <span className="text-red-700">Broken</span>}
+            <span className={broken ? `text-xl ${state ? STATE[state].text : "text-slate-500"}` : state ? STATE[state].text : "text-slate-500"}>
+              {state ? STATE[state].label : noStatus}
+            </span>
+          </p>
+          <p className="mt-1 text-slate-700">{headline}</p>
+          {broken && <p className="mt-1 text-sm text-slate-500">Broken since {clock(broken.since)}</p>}
         </div>
 
         {/* Temperature */}
@@ -511,7 +668,14 @@ function MachineView(props: {
 
         <Side title="Monitoring">
           <dl className="divide-y divide-slate-100 text-sm">
-            <Row label="Last reading" value={last ? `${ago(now, last.t)} ago` : "None yet"} bad={!last || now - Date.parse(last.t) > STALE_MS} />
+            <Row label="Status (from database)" value={state ? STATE[state].label : noStatus} bad={state === "offline" || !state} />
+            <Row
+              label="Last stored in database"
+              value={activity?.last_received_at ? `${ago(now, activity.last_received_at)} ago` : "Never"}
+              bad={state === "offline"}
+            />
+            <Row label="Stored in the last minute" value={activity ? String(activity.readings_last_minute) : "—"} />
+            <Row label="Last reading received" value={last ? `${ago(now, last.t)} ago` : "None yet"} bad={!last || now - Date.parse(last.t) > STALE_MS} />
             <Row label="Readings in the last minute" value={String(points.filter((p) => now - Date.parse(p.t) < 60_000).length)} />
             <Row label="Temperature sensor" value={sensorState(last?.thermistor_valid, flags.has("thermistor_fault"))} bad={flags.has("thermistor_fault")} />
             <Row label="Accelerometer" value={sensorState(last?.accel_valid, flags.has("accel_fault"))} bad={flags.has("accel_fault")} />
