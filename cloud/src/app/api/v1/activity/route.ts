@@ -1,7 +1,7 @@
 import { connection } from "next/server";
 import { activityConfigFromEnv, classifyActivity, type StoredSample } from "@/lib/activity";
 import { db } from "@/lib/db";
-import { RUN_STATE_TEXT, WINDOW_FRESH_MS, runState } from "@/lib/runState";
+import { DEFAULT_RUN_PROFILE, RUN_STATE_TEXT, WINDOW_FRESH_MS, runState } from "@/lib/runState";
 
 // GET /api/v1/activity
 // For every machine, from the DATABASE (not the server's memory): is it online,
@@ -45,6 +45,7 @@ export async function GET() {
     checked_at: now.toISOString(),
     offline_after_ms: cfg.offlineAfterMs,
     idle_spread_max_g: cfg.idleSpreadMaxG,
+    abnormal_above_mm_s: DEFAULT_RUN_PROFILE.abnormalAboveMmS, // the vibration alert line, for charts
     machines: machines.map((m) => {
       const a = classifyActivity(last.get(m.id) ?? null, samples.get(m.id) ?? [], now, cfg);
       const alert = open.find((x) => x.machineId === m.id) ?? null;
