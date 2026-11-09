@@ -226,9 +226,15 @@ export function evaluate(
   }
 
   const a = reading.accel;
+  const repeats = a === null ? 0 : identicalBefore(a, history);
   if (reading.accelValid === false || (a !== null && a.x === 0 && a.y === 0 && a.z === 0)) {
     flags.push("accel_fault"); // a working sensor always reads ~1 g of gravity
-  } else if (a !== null) {
+  } else if (a !== null && repeats + 1 >= STUCK_REPEATS) {
+    flags.push("accel_fault"); // the same reading again and again: frozen sensor or loose wire
+  } else if (a !== null && repeats === 0) {
+    // A repeat of the previous reading carries no new information, so it's never a new shock:
+    // a sensor that freezes at its ±4 g limit must not open a vibration alert before it's
+    // recognised as stuck.
     if (Math.abs(Math.hypot(a.x, a.y, a.z) - 1) > cfg.shockToleranceG) flags.push("shock");
     const recent = history
       .filter((h) => h.accel !== null && !h.flags.includes("accel_fault"))
@@ -240,6 +246,22 @@ export function evaluate(
     }
   }
   return { temperatureC, flags };
+}
+
+// A real accelerometer always has a little noise, so identical readings in a row mean it has
+// stopped updating. Real drill data (Sun Nov 8, ~2,800 readings, still and running): never more
+// than 2 identical in a row. A wire knocked loose (MG-001-TEST, same evening): 234 to 377.
+export const STUCK_REPEATS = 5; // 2.5 s at 2 readings/s
+
+// How many readings right before this one had exactly the same accelerometer values.
+function identicalBefore(a: Vec3, history: readonly StoredReading[]): number {
+  let n = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i].accel;
+    if (!h || h.x !== a.x || h.y !== a.y || h.z !== a.z) break;
+    n++;
+  }
+  return n;
 }
 
 // °C per minute, against the oldest usable reading in the window (at least 10 s back).
