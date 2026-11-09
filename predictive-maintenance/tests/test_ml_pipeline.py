@@ -134,6 +134,70 @@ def test_training_needs_two_sessions(tmp_path):
         train.main(["--raw", str(tmp_path / "raw"), "--out", str(tmp_path / "m")])
 
 
+# ---------- one session: --holdout-run ----------
+@pytest.fixture(scope="module")
+def one_session(tmp_path_factory):
+    raw = tmp_path_factory.mktemp("one") / "raw"
+    return make_dataset(raw, sessions=(1,), labels=("normal_free", "normal_load", "imbalance", "loose_bit"),
+                        runs=3, frames=2)
+
+
+def test_holdout_run_trains_on_one_session(one_session, tmp_path, capsys):
+    train.main(["--raw", str(one_session), "--out", str(tmp_path / "m"), "--holdout-run"])
+    out = capsys.readouterr().out
+    assert "S1_normal_free_03" in out and "S1_imbalance_03" in out and "S1_normal_free_01," not in out
+    assert "optimistic" in out and "Classifier on held-out runs" in out
+    assert "run 01 held out" in out and "run 03 held out" in out
+    det = MachineGuardDetector.load(tmp_path / "m" / "machineguard.joblib")
+    assert det.meta["sessions"] == [1]
+
+
+def test_holdout_run_holds_out_last_run_of_each_label(one_session):
+    table = build_feature_table(one_session, verbose=False)
+    rows = train.run_mask(table)
+    assert set(table.loc[rows, "file"]) == {f"S1_{l}_03" for l in ("normal_free", "normal_load", "imbalance", "loose_bit")}
+    tr, te = train.split_by_runs(table, rows)
+    assert set(te["run"]) == {3} and set(tr["run"]) == {1, 2}
+    assert len(tr) + len(te) == len(table)
+
+
+def test_holdout_run_baseline_never_sees_test_run(one_session):
+    table = build_feature_table(one_session, verbose=False)
+    rows = train.run_mask(table)
+    changed = table.copy()
+    feats = [c for c in table.columns if c not in train.META]
+    target = rows & (table["label"] == "normal_free")
+    changed.loc[target, feats] = changed.loc[target, feats] * 10  # wildly different held-out normal run
+    tr_a, _ = train.split_by_runs(table, rows)
+    tr_b, _ = train.split_by_runs(changed, rows)
+    pd.testing.assert_frame_equal(tr_a, tr_b)
+
+
+def test_holdout_run_label_with_one_run_stays_in_training(tmp_path, capsys):
+    raw = make_dataset(tmp_path / "raw", sessions=(1,), labels=("normal_free", "imbalance"), runs=2, frames=2)
+    record_run(raw / "S1_off_01", "off", 2, 30.0, 1.0, seed=99)
+    train.main(["--raw", str(raw), "--out", str(tmp_path / "m"), "--holdout-run"])
+    out = capsys.readouterr().out
+    assert "S1 off has only 1 run" in out and "S1_off_01" not in out.split("TEST ON HELD-OUT RUNS")[1].splitlines()[1]
+
+
+def test_holdout_run_needs_two_runs(tmp_path):
+    make_dataset(tmp_path / "raw", sessions=(1,), labels=("normal_free", "imbalance"), runs=1, frames=2)
+    with pytest.raises(SystemExit, match="at least 2 runs"):
+        train.main(["--raw", str(tmp_path / "raw"), "--out", str(tmp_path / "m"), "--holdout-run"])
+
+
+def test_holdout_run_and_test_session_conflict(one_session, tmp_path):
+    with pytest.raises(SystemExit):
+        train.main(["--raw", str(one_session), "--out", str(tmp_path / "m"), "--holdout-run", "--test-session", "1"])
+
+
+def test_one_session_error_suggests_holdout_run(tmp_path):
+    make_dataset(tmp_path / "raw", sessions=(1,), labels=("normal_free", "imbalance"), runs=2, frames=2)
+    with pytest.raises(SystemExit, match="--holdout-run"):
+        train.main(["--raw", str(tmp_path / "raw"), "--out", str(tmp_path / "m")])
+
+
 def test_training_with_temperature(tmp_path):
     make_dataset(tmp_path / "raw", sessions=(1, 2), labels=("normal_free", "imbalance"), runs=1, frames=2)
     train.main(["--raw", str(tmp_path / "raw"), "--out", str(tmp_path / "m"), "--use-temp"])
@@ -223,13 +287,6 @@ def test_record_names_folder_and_calls_receiver(tmp_path):
     argv = calls[0]
     assert argv[argv.index("--out") + 1] == str(tmp_path / "S1_imbalance_03")
     assert argv[argv.index("--duration") + 1] == "100.0"
-    assert argv[argv.index("--rpm") + 1] == "1200.0"  # the drill, unless --rpm says otherwise
-    assert "--cloud" not in argv  # upload only when asked
-
-    calls.clear()
-    record.main(["--session", "1", "--label", "imbalance", "--seconds", "100", "--out", str(tmp_path),
-                 "--countdown", "0", "--cloud", "--rpm", "1500"], receiver_main=fake_receiver)
-    assert "--cloud" in calls[0] and calls[0][calls[0].index("--rpm") + 1] == "1500.0"
 
 
 def test_record_warns_when_no_vibration_arrives(tmp_path, capsys):

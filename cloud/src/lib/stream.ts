@@ -226,9 +226,15 @@ export function evaluate(
   }
 
   const a = reading.accel;
+  const repeats = a === null ? 0 : identicalBefore(a, history);
   if (reading.accelValid === false || (a !== null && a.x === 0 && a.y === 0 && a.z === 0)) {
     flags.push("accel_fault"); // a working sensor always reads ~1 g of gravity
-  } else if (a !== null) {
+  } else if (a !== null && repeats + 1 >= STUCK_REPEATS) {
+    flags.push("accel_fault"); // the same reading again and again: frozen sensor or loose wire
+  } else if (a !== null && repeats === 0) {
+    // A repeat of the previous reading carries no new information, so it's never a new shock:
+    // a sensor that freezes at its ±4 g limit must not open a vibration alert before it's
+    // recognised as stuck.
     if (Math.abs(Math.hypot(a.x, a.y, a.z) - 1) > cfg.shockToleranceG) flags.push("shock");
     const recent = history
       .filter((h) => h.accel !== null && !h.flags.includes("accel_fault"))
@@ -240,6 +246,22 @@ export function evaluate(
     }
   }
   return { temperatureC, flags };
+}
+
+// A real accelerometer always has a little noise, so identical readings in a row mean it has
+// stopped updating. Real drill data (Sun Nov 8, ~2,800 readings, still and running): never more
+// than 2 identical in a row. A wire knocked loose (MG-001-TEST, same evening): 234 to 377.
+export const STUCK_REPEATS = 5; // 2.5 s at 2 readings/s
+
+// How many readings right before this one had exactly the same accelerometer values.
+function identicalBefore(a: Vec3, history: readonly StoredReading[]): number {
+  let n = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i].accel;
+    if (!h || h.x !== a.x || h.y !== a.y || h.z !== a.z) break;
+    n++;
+  }
+  return n;
 }
 
 // °C per minute, against the oldest usable reading in the window (at least 10 s back).
@@ -269,7 +291,7 @@ function describeAlert(flags: string[]): { kind: string; severity: "alert" | "wa
   const set = new Set(flags);
   const kinds: string[] = [];
   if (set.has("temp_high") || set.has("temp_rising")) kinds.push("overheat");
-  if (set.has("vibration_high") || set.has("shock")) kinds.push("vibration");
+  if (set.has("vibration_high") || set.has("shock") || set.has("vibration_severe")) kinds.push("vibration");
   if (set.has("thermistor_fault") || set.has("accel_fault")) kinds.push("sensor_fault");
   const onlyFault = kinds.length === 1 && kinds[0] === "sensor_fault";
   return {
@@ -297,12 +319,20 @@ type MachineState = {
   abnormalStreak: number;
   normalStreak: number;
   inAlert: boolean;
+  // Vibration windows (every 10 s, from the gateway's FFT) count separately from status packets.
+  windowAbnormalStreak: number;
+  windowNormalStreak: number;
+  windowAbnormal: boolean; // the windows say "far above normal" right now
   dropped: number;
   lastFlushAt: Date | null;
   lastError: string | null;
 };
 
 const DUPLICATE_MEMORY = 2000; // > what the gateway can hold (its backlog is 2000)
+
+// Vibration windows arrive every 10 s: 2 in a row is ~20 s of evidence either way.
+export const WINDOW_CONFIRM = 2;
+export const WINDOW_CLEAR = 2;
 
 export class StreamBuffer {
   readonly cfg: StreamConfig;
@@ -379,12 +409,53 @@ export class StreamBuffer {
     } else if (s.inAlert && flags.length > 0) {
       stored.abnormal = true;
       flushNow = true;
-    } else if (s.inAlert && s.normalStreak >= this.cfg.clearCount) {
+    } else if (s.inAlert && s.normalStreak >= this.cfg.clearCount && !s.windowAbnormal) {
       s.inAlert = false;
       s.events.push({ type: "resolve", machineId: r.machineId, at: r.receivedAt });
     }
 
     return { duplicate: false, flags, temperatureC, flushNow };
+  }
+
+  // One analysed vibration window, already judged by the caller (lib/runState.ts: "abnormal" =
+  // vibration far above this machine's normal running). WINDOW_CONFIRM abnormal windows in a row
+  // open an alert; WINDOW_CLEAR normal ones end the window side of it. The alert itself closes only
+  // when the status packets are quiet too, and the status side can't close it while the windows
+  // still say abnormal. A repeated packetId (a gateway retry) is ignored.
+  addWindow(machineId: string, at: Date, abnormal: boolean, packetId: string | null = null): { flushNow: boolean } {
+    const s = this.state(machineId);
+    if (packetId !== null) {
+      const key = `window:${packetId}`;
+      if (s.seen.has(key)) return { flushNow: false };
+      s.seen.add(key);
+      s.seenOrder.push(key);
+      if (s.seenOrder.length > DUPLICATE_MEMORY) s.seen.delete(s.seenOrder.shift() as string);
+    }
+    let flushNow = false;
+    if (abnormal) {
+      s.windowAbnormalStreak++;
+      s.windowNormalStreak = 0;
+      if (!s.windowAbnormal && s.windowAbnormalStreak >= WINDOW_CONFIRM) {
+        s.windowAbnormal = true;
+        if (!s.inAlert) {
+          s.inAlert = true;
+          s.events.push({ type: "open", machineId, at, ...describeAlert(["vibration_severe"]) });
+          flushNow = true;
+        }
+      }
+    } else {
+      s.windowNormalStreak++;
+      s.windowAbnormalStreak = 0;
+      if (s.windowAbnormal && s.windowNormalStreak >= WINDOW_CLEAR) {
+        s.windowAbnormal = false;
+        if (s.inAlert && s.abnormalStreak === 0) {
+          s.inAlert = false;
+          s.events.push({ type: "resolve", machineId, at });
+          flushNow = true;
+        }
+      }
+    }
+    return { flushNow };
   }
 
   // Writes the held packets (one machine, or all). Writes never overlap: each
@@ -500,6 +571,9 @@ export class StreamBuffer {
         abnormalStreak: 0,
         normalStreak: 0,
         inAlert: false,
+        windowAbnormalStreak: 0,
+        windowNormalStreak: 0,
+        windowAbnormal: false,
         dropped: 0,
         lastFlushAt: null,
         lastError: null,

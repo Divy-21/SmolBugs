@@ -605,3 +605,56 @@ def test_run_no_vibration_warning_when_windows_arrive(monkeypatch):
     h, lines = _quiet()
     asyncio.run(run(h, FakeBoardScanner, FakeBoardClient, duration_s=1.0))
     assert h.window_count >= 1 and not any("no vibration data" in l for l in lines)
+
+
+# ---------------------------------------------------------------- reconnect when Bluetooth drops
+
+def test_reconnects_after_the_link_drops(monkeypatch):
+    from ingest.ble_receiver import run_with_reconnect
+
+    class DropsAfterAWhile(FakeBoardClient):
+        connects = 0
+
+        async def __aenter__(self):
+            type(self).connects += 1
+            await super().__aenter__()
+            asyncio.get_running_loop().call_later(0.3, setattr, self, "is_connected", False)
+            return self
+
+    monkeypatch.setattr(FakeBoardClient, "frame_gap_s", 0.0)
+    h, lines = _quiet()
+    n = run_with_reconnect(h, FakeBoardScanner, DropsAfterAWhile, duration_s=1.5, delay_s=0.05)
+    assert n >= 3 and DropsAfterAWhile.connects == n
+    assert any("Connection lost; trying again" in l for l in lines)
+    assert h.temperature_count > 0  # data kept flowing across the reconnects
+
+
+def test_keeps_looking_when_the_board_isnt_there_yet():
+    from ingest.ble_receiver import run_with_reconnect
+
+    class AppearsOnThirdScan:
+        scans = 0
+
+        @classmethod
+        async def find_device_by_name(cls, name, timeout=15.0):
+            cls.scans += 1
+            return await FakeBoardScanner.find_device_by_name(name) if cls.scans >= 3 else None
+
+    h, lines = _quiet()
+    n = run_with_reconnect(h, AppearsOnThirdScan, FakeBoardClient, duration_s=0.8, delay_s=0.01)
+    assert n == 1 and AppearsOnThirdScan.scans >= 3
+    assert sum("Board not found; trying again" in l for l in lines) == 2
+
+
+def test_no_reconnect_exits_after_the_first_drop():
+    from ingest.ble_receiver import run_with_reconnect
+
+    class Drops(FakeBoardClient):
+        async def __aenter__(self):
+            await super().__aenter__()
+            asyncio.get_running_loop().call_later(0.1, setattr, self, "is_connected", False)
+            return self
+
+    h, lines = _quiet()
+    assert run_with_reconnect(h, FakeBoardScanner, Drops, duration_s=5, reconnect=False, delay_s=0.01) == 1
+    assert not any("trying again" in l for l in lines)

@@ -1,18 +1,21 @@
 import { connection } from "next/server";
 import { activityConfigFromEnv, classifyActivity, type StoredSample } from "@/lib/activity";
 import { db } from "@/lib/db";
+import { RUN_STATE_TEXT, WINDOW_FRESH_MS, runState } from "@/lib/runState";
 
 // GET /api/v1/activity
 // For every machine, from the DATABASE (not the server's memory): is it online,
 // idle or offline, when was its last reading stored, and is it broken (an alert
 // still open)? The dashboard polls this every few seconds. Rules: src/lib/activity.ts.
+// run_state (off / handled / running / abnormal) comes from the latest vibration window,
+// null if there is none from the last 30 s. Rules: src/lib/runState.ts.
 export async function GET() {
   await connection();
   const cfg = activityConfigFromEnv();
   const now = new Date();
   const since = new Date(now.getTime() - 60_000);
 
-  const [machines, lastStored, recent, open] = await Promise.all([
+  const [machines, lastStored, recent, open, windows] = await Promise.all([
     db().machine.findMany({ select: { id: true, name: true }, orderBy: { id: "asc" } }),
     db().statusPacket.groupBy({ by: ["machineId"], _max: { receivedAt: true } }),
     db().statusPacket.findMany({
@@ -22,7 +25,13 @@ export async function GET() {
       select: { machineId: true, receivedAt: true, accelXG: true, accelYG: true, accelZG: true },
     }),
     db().alert.findMany({ where: { resolvedAt: null }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }),
+    db().vibrationWindow.findMany({
+      distinct: ["machineId"],
+      orderBy: [{ machineId: "asc" }, { receivedAt: "desc" }, { id: "desc" }],
+      select: { machineId: true, receivedAt: true, velocityRmsMmS: true, dominantFreqHz: true },
+    }),
   ]);
+  const latestWindow = new Map(windows.map((w) => [w.machineId, w]));
 
   const last = new Map(lastStored.map((g) => [g.machineId, g._max.receivedAt ?? null]));
   const samples = new Map<string, StoredSample[]>();
@@ -39,6 +48,10 @@ export async function GET() {
     machines: machines.map((m) => {
       const a = classifyActivity(last.get(m.id) ?? null, samples.get(m.id) ?? [], now, cfg);
       const alert = open.find((x) => x.machineId === m.id) ?? null;
+      const w = latestWindow.get(m.id);
+      const fresh = w && w.velocityRmsMmS !== null && w.dominantFreqHz !== null &&
+        now.getTime() - w.receivedAt.getTime() <= WINDOW_FRESH_MS;
+      const run = fresh ? runState(w.velocityRmsMmS as number, w.dominantFreqHz as number) : null;
       return {
         machine_id: m.id,
         state: a.state,
@@ -47,6 +60,11 @@ export async function GET() {
         age_ms: a.ageMs,
         readings_last_minute: a.readingsLastMinute,
         vibration_spread_g: a.vibrationSpreadG,
+        run_state: run,
+        run_state_text: run ? RUN_STATE_TEXT[run] : null,
+        vibration_mm_s: w?.velocityRmsMmS ?? null, // latest window, however old (see window_at)
+        main_freq_hz: w?.dominantFreqHz ?? null,
+        window_at: w?.receivedAt.toISOString() ?? null,
         broken: alert
           ? {
               alert_id: alert.id,

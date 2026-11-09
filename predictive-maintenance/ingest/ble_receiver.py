@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -37,6 +38,7 @@ from processing.ble_protocol import MIN_MTU, TEMPERATURE_CHAR_UUID, VIBRATION_CH
 
 DEVICE_NAME = "MachineGuard"
 MAX_JSON_BUFFER = 8192  # bytes; guards against a message that never ends
+RECONNECT_DELAY_S = 3.0  # wait before reconnecting after the Bluetooth link drops
 NO_VIBRATION_WARN_S = 25.0  # the board sends a window every 10 s; say so if none has started by now
 
 
@@ -310,12 +312,13 @@ async def run(handler: MachineGuardHandler, scanner_cls=None, client_cls=None,
             handler.log(f"Vibration characteristic not available ({err}); temperature only.")
 
         handler.log("Receiving. Press Ctrl+C to stop.\n")
+        started = time.monotonic()
         elapsed = 0.0
         frames_at_connect = handler.decoder.stats.frames
         warned_no_vibration = not vibration_subscribed
         while client.is_connected and (duration_s is None or elapsed < duration_s):
             await asyncio.sleep(0.2)
-            elapsed += 0.2
+            elapsed = time.monotonic() - started  # the clock, not a count of sleeps (they can end early)
             if (not warned_no_vibration and elapsed >= NO_VIBRATION_WARN_S
                     and handler.decoder.stats.frames == frames_at_connect):
                 warned_no_vibration = True
@@ -326,6 +329,34 @@ async def run(handler: MachineGuardHandler, scanner_cls=None, client_cls=None,
                     "'Vibration capture:'. Temperature readings are still being received.")
     handler.log("\n" + handler.summary())
     return True
+
+
+def run_with_reconnect(handler: MachineGuardHandler, scanner_cls=None, client_cls=None,
+                       duration_s: float | None = None, reconnect: bool = True,
+                       delay_s: float = RECONNECT_DELAY_S) -> int:
+    """run(), again and again: if the Bluetooth link drops (or the board isn't found), wait
+    delay_s and connect again, until duration_s has passed or Ctrl+C. Returns how many times it
+    connected. Bluetooth being switched off still stops it (that needs a person)."""
+    start = time.monotonic()
+    connections = 0
+    while True:
+        remaining = None if duration_s is None else duration_s - (time.monotonic() - start)
+        if remaining is not None and remaining <= 0:
+            break
+        try:
+            found = asyncio.run(run(handler, scanner_cls, client_cls, remaining))
+        except Exception as err:
+            if type(err).__name__ == "BleakBluetoothNotAvailableError":
+                raise
+            handler.log(f"Bluetooth error: {err}")
+            found = False
+        connections += found
+        if not reconnect or (duration_s is not None and time.monotonic() - start >= duration_s):
+            break
+        what = "Connection lost" if found else "Board not found"
+        handler.log(f"{what}; trying again in {delay_s:.0f} s (Ctrl+C to stop).")
+        time.sleep(delay_s)
+    return connections
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -339,6 +370,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--cloud", action="store_true",
                         help="also upload to the SmolBugs cloud (device key from DEVICE_KEY or smolbugs.env)")
     parser.add_argument("--duration", type=float, help="stop after this many seconds")
+    parser.add_argument("--no-reconnect", action="store_true",
+                        help="exit when the Bluetooth link drops (default: reconnect until Ctrl+C)")
     args = parser.parse_args(argv)
 
     if args.live_html and not args.out:
@@ -362,7 +395,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.live_html:
         handler.log(f"Live report: {args.out / 'fft_report.html'} (open it once; it refreshes itself)")
     try:
-        asyncio.run(run(handler, scanner_cls, client_cls, args.duration))
+        run_with_reconnect(handler, scanner_cls, client_cls, args.duration, reconnect=not args.no_reconnect)
     except KeyboardInterrupt:
         if cloud is not None:
             cloud.close()
