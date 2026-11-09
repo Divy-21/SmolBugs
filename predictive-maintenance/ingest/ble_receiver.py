@@ -13,6 +13,10 @@ Run from the predictive-maintenance folder:
     python -m ingest.ble_receiver --rpm 3000 --out data/session1
     python -m ingest.ble_receiver --rpm 3000 --out data/session1 --live-html
     python -m ingest.ble_receiver --cloud            # also upload (needs a device key; see ingest/cloud.py)
+    python -m ingest.ble_receiver --relearn          # the model learns this drill's normal again (sensor moved)
+
+Xavion's trained model (models/machineguard.joblib) runs on every window when it's there; see
+ingest/live_model.py. --no-model turns it off.
 
 Every status reading and analysed window carries boot_id, seq and packet_id (see ingest/cloud.py).
 """
@@ -33,6 +37,7 @@ from processing import FFTConfig, ThermistorConfig, analyze_window, parse_thermi
 from processing.temperature import thermistor_resistance, voltage_to_celsius
 
 from ingest.cloud import STATUS_ENDPOINT, WINDOWS_ENDPOINT, CloudSender, IdentityTracker, sender_from_env
+from ingest.live_model import DEFAULT_MODEL, LiveModel
 from processing.assembler import PacketError
 from processing.ble_protocol import MIN_MTU, TEMPERATURE_CHAR_UUID, VIBRATION_CHAR_UUID, BleVibrationDecoder
 
@@ -56,6 +61,7 @@ class MachineGuardHandler:
         live_html: bool = False,
         cloud: CloudSender | None = None,
         identity: IdentityTracker | None = None,
+        model: LiveModel | None = None,
     ):
         self.machine_id = machine_id
         self.rpm = rpm
@@ -71,6 +77,8 @@ class MachineGuardHandler:
         self._json_buffer = b""
         self._json_noted = False
         self.window_count = 0
+        self.model = model
+        self._model_failed = False
         self.out_dir = Path(out_dir) if out_dir else None
         if live_html and not self.out_dir:
             raise ValueError("live_html needs out_dir")
@@ -217,6 +225,9 @@ class MachineGuardHandler:
         self.log(line)
         for warning in result["warnings"]:
             self.log(f"      warning: {warning}")
+        ml = self._run_model(window, result)
+        if ml is not None:
+            result["ml"] = ml
 
         self._append_jsonl("vibration.jsonl", result)
         self._submit(WINDOWS_ENDPOINT, result)
@@ -234,6 +245,25 @@ class MachineGuardHandler:
             except Exception as err:  # a plotting problem must never stop data collection
                 self.log(f"      report not updated: {err}")
         return result
+
+    def _run_model(self, window, result: dict[str, Any]) -> dict[str, Any] | None:
+        """The trained model's answer for this window. A model error turns the model off for the
+        rest of the run; it never stops the receiver."""
+        if self.model is None or self._model_failed:
+            return None
+        velocity = max(a["velocity_rms_mm_s"] for a in result["axes"].values())
+        try:
+            ml = self.model.check(window.accel_g, window.sample_rate_hz, velocity)
+        except Exception as err:
+            self._model_failed = True
+            self.log(f"      model error, turning the model off for this run: {err!r}")
+            return None
+        if ml is not None:
+            judged = ml["state"] in ("ok", "fault") and ml["confidence"] is not None
+            sure = f", {ml['confidence']:.0%} sure" if judged else ""
+            votes = f", {ml['agree']}/{ml['of']} agree" if ml["agree"] is not None else ""
+            self.log(f"      model: {ml['message']}{sure}{votes}")
+        return ml
 
     def summary(self) -> str:
         s = self.decoder.stats
@@ -372,6 +402,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--duration", type=float, help="stop after this many seconds")
     parser.add_argument("--no-reconnect", action="store_true",
                         help="exit when the Bluetooth link drops (default: reconnect until Ctrl+C)")
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="trained model to run on every window")
+    parser.add_argument("--no-model", action="store_true", help="don't run the trained model")
+    parser.add_argument("--relearn", action="store_true",
+                        help="forget this machine's saved normal and learn it again (after moving the sensor)")
     args = parser.parse_args(argv)
 
     if args.live_html and not args.out:
@@ -382,8 +416,9 @@ def main(argv: list[str] | None = None) -> None:
             cloud = sender_from_env()
         except ValueError as err:
             parser.error(str(err))
+    model = None if args.no_model else LiveModel.load(args.model, args.machine_id, relearn=args.relearn)
     handler = MachineGuardHandler(args.machine_id, rpm=args.rpm, out_dir=args.out, live_html=args.live_html,
-                                  cloud=cloud)
+                                  cloud=cloud, model=model)
     if cloud is not None:
         handler.log(f"Cloud upload: {cloud.base_url}")
         cloud.start()

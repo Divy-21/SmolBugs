@@ -1,6 +1,7 @@
 import { connection } from "next/server";
 import { activityConfigFromEnv, classifyActivity, type StoredSample } from "@/lib/activity";
 import { db } from "@/lib/db";
+import { readModel } from "@/lib/packets";
 import { DEFAULT_RUN_PROFILE, RUN_STATE_TEXT, WINDOW_FRESH_MS, runState } from "@/lib/runState";
 
 // GET /api/v1/activity
@@ -9,6 +10,8 @@ import { DEFAULT_RUN_PROFILE, RUN_STATE_TEXT, WINDOW_FRESH_MS, runState } from "
 // still open)? The dashboard polls this every few seconds. Rules: src/lib/activity.ts.
 // run_state (off / handled / running / abnormal) comes from the latest vibration window,
 // null if there is none from the last 30 s. Rules: src/lib/runState.ts.
+// model is the trained model's answer from that same window (the gateway runs it), null when the
+// window is older than 30 s or the gateway isn't running the model. Shape: lib/packets.ts modelAnswer.
 export async function GET() {
   await connection();
   const cfg = activityConfigFromEnv();
@@ -28,7 +31,7 @@ export async function GET() {
     db().vibrationWindow.findMany({
       distinct: ["machineId"],
       orderBy: [{ machineId: "asc" }, { receivedAt: "desc" }, { id: "desc" }],
-      select: { machineId: true, receivedAt: true, velocityRmsMmS: true, dominantFreqHz: true },
+      select: { machineId: true, receivedAt: true, velocityRmsMmS: true, dominantFreqHz: true, payload: true },
     }),
   ]);
   const latestWindow = new Map(windows.map((w) => [w.machineId, w]));
@@ -66,6 +69,7 @@ export async function GET() {
         vibration_mm_s: w?.velocityRmsMmS ?? null, // latest window, however old (see window_at)
         main_freq_hz: w?.dominantFreqHz ?? null,
         window_at: w?.receivedAt.toISOString() ?? null,
+        model: fresh ? readModel(w.payload) : null,
         broken: alert
           ? {
               alert_id: alert.id,

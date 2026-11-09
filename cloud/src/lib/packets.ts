@@ -88,6 +88,28 @@ const axis = z.looseObject({
     .optional(),
 });
 
+// The trained model's answer for this window, added by the gateway when the model is running
+// (predictive-maintenance/ingest/live_model.py). Lenient on purpose: an odd answer is dropped by
+// readModel() when it's shown, it never makes the gateway's window bounce.
+export const MODEL_STATES = ["learning", "off", "ok", "check", "fault"] as const;
+export const modelAnswer = z.looseObject({
+  state: z.enum(MODEL_STATES),
+  label: z.string().nullable().optional(),
+  confidence: z.number().min(0).max(1).nullable().optional(),
+  message: z.string().max(200),
+  recommendation: z.string().max(300).nullable().optional(),
+  agree: z.number().int().nullable().optional(),
+  of: z.number().int().nullable().optional(),
+});
+export type ModelAnswer = z.infer<typeof modelAnswer>;
+
+/** The model's answer stored in a window's payload, or null if there's none or it's malformed. */
+export function readModel(payload: unknown): ModelAnswer | null {
+  if (!payload || typeof payload !== "object" || !("ml" in payload)) return null;
+  const r = modelAnswer.safeParse((payload as { ml: unknown }).ml);
+  return r.success ? r.data : null;
+}
+
 export const vibrationWindow = z.looseObject({
   machine_id: machineId,
   window_id: z.number().int().nonnegative(),

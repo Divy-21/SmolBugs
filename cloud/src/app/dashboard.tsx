@@ -96,6 +96,17 @@ type ActivityRow = {
   vibration_mm_s: number | null;
   main_freq_hz: number | null;
   window_at: string | null;
+  // The trained model's answer for that same window (the gateway runs it), null when the window
+  // is older than 30 s or the gateway isn't running the model. Shape: src/lib/packets.ts.
+  model: ModelAnswer | null;
+};
+
+type ModelAnswer = {
+  state: "learning" | "off" | "ok" | "check" | "fault";
+  label?: string | null;
+  confidence?: number | null;
+  message: string;
+  recommendation?: string | null;
 };
 
 type RunState = "off" | "handled" | "running" | "abnormal";
@@ -608,6 +619,11 @@ function MachineTile(props: {
             {broken && SUGGESTED_CHECK[broken.kind] && (
               <span className="mt-1 block text-[15px] text-navy/80">{SUGGESTED_CHECK[broken.kind]}</span>
             )}
+            {activity?.model && (
+              <span className={`mt-1 block text-sm ${MODEL_TONE[activity.model.state]}`}>
+                Model: {modelText(activity.model)}
+              </span>
+            )}
           </span>
           <span className="w-28 shrink-0">
             {vib.length > 1 && <TileTrace points={vib} limit={limits?.vibration_std_max_g ?? null} />}
@@ -623,6 +639,39 @@ function MachineTile(props: {
         </span>
       </span>
     </button>
+  );
+}
+
+// The trained model's answer (Xavion's isolation forest + classifier, run by the gateway on every
+// 10-second clip). Shown, not alerted on: phone alerts still come from the vibration line.
+const MODEL_TONE: Record<ModelAnswer["state"], string> = {
+  learning: "text-navy/70",
+  off: "text-navy/70",
+  ok: "text-emerald-700",
+  check: "text-amber-ink",
+  fault: "text-amber-ink",
+};
+
+function modelText(m: ModelAnswer): string {
+  const sure = (m.state === "ok" || m.state === "fault") && m.confidence != null
+    ? `, ${Math.round(m.confidence * 100)}% sure`
+    : "";
+  return m.message.replace(/:.*$/, "") + sure; // "Loose bit or chuck: rattling" -> "Loose bit or chuck"
+}
+
+function ModelLine({ answer }: { answer: ModelAnswer }) {
+  const advise = answer.state === "check" || answer.state === "fault" || answer.state === "learning";
+  return (
+    <div className="mt-4 border-t border-line/70 pt-3 text-sm">
+      <p>
+        <span className="text-navy/70">Trained model: </span>
+        <span className={`font-medium ${MODEL_TONE[answer.state]}`}>{answer.message}</span>
+        {(answer.state === "ok" || answer.state === "fault") && answer.confidence != null && (
+          <span className="text-navy/70"> ({Math.round(answer.confidence * 100)}% sure)</span>
+        )}
+      </p>
+      {advise && answer.recommendation && <p className="mt-1 text-navy/75">{answer.recommendation}</p>}
+    </div>
   );
 }
 
@@ -748,6 +797,7 @@ function MachineView(props: {
             <span className="font-medium">Suggested check:</span> {SUGGESTED_CHECK[broken.kind]}
           </p>
         )}
+        {activity?.model && <ModelLine answer={activity.model} />}
       </section>
 
       {/* Readings */}

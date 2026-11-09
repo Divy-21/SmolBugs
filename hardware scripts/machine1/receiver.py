@@ -14,6 +14,10 @@ What the shortcut adds:
   - Every run is saved to data/run-<date>-<time>/ unless you pass --out.
   - --simulate (fake board) uploads as MG-SIM, never as the real MG-001.
   - --no-cloud: print and save only.
+  - Xavion's trained model runs on every window when predictive-maintenance/models/machineguard.joblib
+    is on this laptop (git doesn't carry it). It spends the first ~30 s of the drill running learning
+    that drill's normal, then the dashboard shows what it says. --relearn after moving the sensor,
+    --no-model to turn it off. Needs scikit-learn: python -m pip install scikit-learn
 
 --rpm defaults to 1200 (the drill). Any other option is passed through, e.g. --duration 60, --machine-id MG-002.
 """
