@@ -5,7 +5,7 @@
 //   off, board still on    0.6 - 0.8 mm/s; the "main frequency" is just noise (often ~303 Hz)
 //   moved by hand           0.6 - 5 mm/s at 2 - 4 Hz
 //   running in the air      8 - 15 mm/s at 67 - 166 Hz
-//   runs 01:27 - 01:35 UTC  8 - 40 mm/s, often ~190 Hz (drilling wood under load? not confirmed)
+//   runs 01:27 - 01:35 UTC  8 - 40 mm/s, often ~190 Hz: the drill rubbed on wood (Manraj: abnormal)
 //   fault test (02:15 UTC)  82 - 88 mm/s at ~10 Hz
 // So the vibration level decides off / abnormal, and the frequency separates a hand from a motor.
 // The main frequency of normal running wanders too much (67 - 166 Hz) to alarm on.
@@ -20,9 +20,9 @@ export type RunProfile = {
   abnormalAboveMmS: number; // above this it is shaking far more than normal running does
 };
 
-// 50 sits between the heaviest run that may be normal use (40 mm/s) and the fault test (82 mm/s).
-// Re-set it once the team confirms what the 01:27 - 01:35 runs were.
-export const DEFAULT_RUN_PROFILE: RunProfile = { offBelowMmS: 1.0, motorAboveHz: 15, abnormalAboveMmS: 50 };
+// Normal running topped out at 14.8 mm/s; 20 is ~35% above it. Rubbing on wood (21 - 40 mm/s) and
+// the off-balance fault test (82 - 88 mm/s) are both above it.
+export const DEFAULT_RUN_PROFILE: RunProfile = { offBelowMmS: 1.0, motorAboveHz: 15, abnormalAboveMmS: 20 };
 
 // The latest window says nothing about now if it's older than this (one every 10 s, plus slack).
 export const WINDOW_FRESH_MS = 30_000;

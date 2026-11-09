@@ -20,8 +20,13 @@ test("running, in the air or into wood: 8-15 mm/s, 67-166 Hz", () => {
   assert.equal(runState(14.80, 135.8), "running"); // the highest normal window
   assert.equal(runState(12.42, 96.4), "running"); // wood, 01:28:15
   assert.equal(runState(5.92, 67.2), "running"); // 00:33:12, spinning up
-  assert.equal(runState(40, 22), "running"); // the heaviest 01:27-01:35 window (wood under load?)
-  assert.equal(runState(28, 193), "running");
+});
+
+test("rubbing on wood (01:27-01:35 UTC, 21-40 mm/s) is abnormal; normal never goes above 20", () => {
+  assert.equal(runState(40, 22), "abnormal");
+  assert.equal(runState(28, 193), "abnormal");
+  assert.equal(runState(21, 189), "abnormal");
+  assert.equal(runState(19.5, 190), "running"); // just under the line
 });
 
 test("the fault test (something off-balance on the drill): ~85 mm/s at ~10 Hz is abnormal, not 'handled'", () => {
