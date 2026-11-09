@@ -198,6 +198,43 @@ test("a frozen reading at a normal value is caught too; real noise and short rep
   }
 });
 
+test("vibration windows: 2 abnormal in a row open an alert, 2 normal close it; a retry isn't counted", () => {
+  const buf = new StreamBuffer(recorder().persist, cfg);
+  const at = (i: number) => new Date(T0 + i * 10_000);
+  assert.equal(buf.addWindow("MG-001", at(1), true, "w1").flushNow, false); // one could be a bump
+  assert.equal(buf.addWindow("MG-001", at(1), true, "w1").flushNow, false); // the same window again
+  assert.equal(buf.machines.get("MG-001")!.events.length, 0);
+  assert.equal(buf.addWindow("MG-001", at(2), true, "w2").flushNow, true); // second in a row: alert
+  const s = buf.machines.get("MG-001")!;
+  const e = s.events[0];
+  assert.ok(e.type === "open" && e.kind === "vibration" && e.severity === "alert", JSON.stringify(e));
+  assert.match((e as { message: string }).message, /vibration_severe/);
+  assert.equal(buf.addWindow("MG-001", at(3), false, "w3").flushNow, false);
+  assert.equal(buf.addWindow("MG-001", at(4), false, "w4").flushNow, true); // 2 normal: closed
+  assert.deepEqual(s.events.map((x) => x.type), ["open", "resolve"]);
+});
+
+test("status packets can't close an alert the windows still see, and the other way round", () => {
+  const buf = new StreamBuffer(recorder().persist, cfg);
+  const at = (i: number) => new Date(T0 + i * 10_000);
+  buf.addWindow("MG-002", at(1), true);
+  buf.addWindow("MG-002", at(2), true); // open, from the windows
+  for (let i = 0; i < 10; i++) buf.add(reading({ machineId: "MG-002" })); // 10 normal status packets
+  const s = buf.machines.get("MG-002")!;
+  assert.deepEqual(s.events.map((x) => x.type), ["open"]); // still open: windows say abnormal
+  buf.addWindow("MG-002", at(3), false);
+  buf.addWindow("MG-002", at(4), false);
+  assert.deepEqual(s.events.map((x) => x.type), ["open", "resolve"]);
+
+  // opened by hot status packets; normal windows alone don't close it
+  const b2 = new StreamBuffer(recorder().persist, cfg);
+  for (let i = 0; i < 3; i++) b2.add(hot());
+  for (let i = 0; i < 4; i++) b2.addWindow("MG-001", at(10 + i), i < 2);
+  b2.addWindow("MG-001", at(20), false);
+  b2.add(hot());
+  assert.deepEqual(b2.machines.get("MG-001")!.events.map((x) => x.type), ["open"]);
+});
+
 test("a packet with only some sensors is fine", () => {
   assert.deepEqual(evaluate(reading({ accel: null, accelValid: null }), [], cfg).flags, []);
   assert.deepEqual(evaluate(reading({ thermistorMv: null, thermistorValid: null }), [], cfg).flags, []);
