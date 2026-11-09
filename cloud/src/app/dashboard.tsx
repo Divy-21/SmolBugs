@@ -1,13 +1,13 @@
 "use client";
 
-// SmolBugs machine-condition dashboard.
+// MachineGuard machine-condition dashboard.
 //
 // Reads only the cloud's own API:
 //   GET /api/v1/live      every 1 s   last ~70 s per machine, from memory (live view)
 //   GET /api/v1/machines  every 10 s  names, kinds, latest stored FFT window
 //   GET /api/v1/alerts    every 5 s   event history
 //   GET /api/v1/activity  every 3 s   online / idle / offline and broken, from the database
-//   GET /api/v1/machines/{id}/readings?minutes=10   every 15 s   10-minute trend (database)
+//   GET /api/v1/machines/{id}/readings?minutes=10   every 10 s   10-minute trend, while shown (database)
 //
 // Health is worked out here from what the endpoint already decided (flags,
 // open alerts) and from how old the last packet is, so "the machine is fine"
@@ -89,11 +89,27 @@ type ActivityRow = {
   readings_last_minute: number;
   vibration_spread_g: number | null;
   broken: Broken | null;
+  // From the latest vibration window (the gateway's FFT, every 10 s). run_state is null when that
+  // window is older than 30 s; the numbers are the latest window's, however old (see window_at).
+  run_state: RunState | null;
+  run_state_text: string | null;
+  vibration_mm_s: number | null;
+  main_freq_hz: number | null;
+  window_at: string | null;
 };
 
-type ActivityResp = { checked_at: string; offline_after_ms: number; idle_spread_max_g: number; machines: ActivityRow[] };
+type RunState = "off" | "handled" | "running" | "abnormal";
 
-type StatusRow = { receivedAt: string; temperatureC: number | null };
+type ActivityResp = {
+  checked_at: string;
+  offline_after_ms: number;
+  idle_spread_max_g: number;
+  abnormal_above_mm_s: number;
+  machines: ActivityRow[];
+};
+
+type StatusRow = { receivedAt: string; temperatureC: number | null; abnormal?: boolean; flags?: string[] | null };
+type WindowRow = { receivedAt: string; velocityRmsMmS: number | null; dominantFreqHz: number | null };
 
 type Point = { t: number; v: number };
 
@@ -148,10 +164,10 @@ const STALE_MS = 10_000; // no packet for 10 s: the link is down, not the machin
 
 // Is the database receiving this machine's data? Online/idle/offline is the one
 // status every machine always has; "broken" is shown on top of it, in its own space.
-const STATE: Record<ActivityState, { rank: number; label: string; bar: string; text: string; dot: string }> = {
-  online: { rank: 0, label: "Online", bar: "bg-emerald-500", text: "text-emerald-700", dot: "bg-emerald-500" },
-  idle: { rank: 1, label: "Idle", bar: "bg-sky-400", text: "text-sky-700", dot: "bg-sky-400" },
-  offline: { rank: 2, label: "Offline", bar: "bg-slate-300", text: "text-slate-500", dot: "bg-slate-400" },
+const STATE: Record<ActivityState, { rank: number; label: string; text: string; dot: string; sideDot: string }> = {
+  online: { rank: 0, label: "Online", text: "text-emerald-700", dot: "bg-emerald-500", sideDot: "bg-emerald-400" },
+  idle: { rank: 1, label: "Idle", text: "text-steel", dot: "bg-steel", sideDot: "bg-sky-300" },
+  offline: { rank: 2, label: "Offline", text: "text-navy/70", dot: "bg-navy/40", sideDot: "bg-cool/40" },
 };
 
 const BROKEN_TITLE: Record<string, string> = {
@@ -173,6 +189,7 @@ const FLAG_TEXT: Record<string, string> = {
   temp_rising: "temperature rising fast",
   shock: "a shock",
   vibration_high: "vibration above limit",
+  vibration_severe: "vibration far above normal running",
   thermistor_fault: "temperature sensor not responding",
   accel_fault: "accelerometer not responding",
 };
@@ -246,6 +263,21 @@ function tempSeries(points: LivePoint[]): Point[] {
   return points.filter((p) => p.temperature_c !== null).map((p) => ({ t: Date.parse(p.t), v: p.temperature_c as number }));
 }
 
+// What the latest vibration window says the machine is doing (lib/runState.ts on the server).
+const RUN_TEXT: Record<RunState, { label: string; tone: string }> = {
+  running: { label: "Running", tone: "text-emerald-700" },
+  off: { label: "Off", tone: "text-steel" },
+  handled: { label: "Being moved", tone: "text-steel" },
+  abnormal: { label: "Vibration far above normal", tone: "text-amber-ink" },
+};
+
+// What to look at first for each alert type (the "recommended action" competitors attach to alerts).
+const SUGGESTED_CHECK: Record<string, string> = {
+  vibration: "Check for loose mounts, imbalance or misalignment",
+  overheat: "Check cooling, lubrication and load",
+  sensor_fault: "Check the sensor's mounting and wiring",
+};
+
 // ---------------------------------------------------------------- page
 
 export default function Dashboard() {
@@ -254,14 +286,14 @@ export default function Dashboard() {
   const machines = usePoll<{ machines: MachineRow[] }>("/api/v1/machines", 10_000);
   const alerts = usePoll<{ alerts: AlertRow[] }>("/api/v1/alerts?limit=100", 5000);
   const activity = usePoll<ActivityResp>("/api/v1/activity", 3000);
-  const [picked, setPicked] = useState<string | null>(null);
+  const [picked, setPicked] = useState<string | null>(null); // null: the overview
 
   const liveOf = (id: string) => live.data?.machines.find((m) => m.machine_id === id);
   const infoOf = (id: string) => machines.data?.machines.find((m) => m.id === id) ?? null;
   const alertsOf = (id: string) => (alerts.data?.alerts ?? []).filter((a) => a.machineId === id);
   const activityOf = (id: string) => activity.data?.machines.find((m) => m.machine_id === id) ?? null;
+  const limitsOf = (id: string) => liveOf(id)?.limits ?? live.data?.limits ?? null;
 
-  // Every machine either source knows, most urgent first.
   const ids = useMemo(() => {
     const set = new Set<string>();
     for (const m of live.data?.machines ?? []) set.add(m.machine_id);
@@ -269,11 +301,12 @@ export default function Dashboard() {
     for (const m of activity.data?.machines ?? []) set.add(m.machine_id);
     return [...set];
   }, [live.data, machines.data, activity.data]);
-  // Broken first, then online, idle, offline.
+
+  // Broken first, then online, idle, offline: the machines that need someone come first.
   const rows: FleetRow[] = ids
     .map((id) => {
       const a = activityOf(id);
-      return { id, state: a?.state ?? null, broken: a?.broken ?? null };
+      return { id, state: a?.state ?? null, broken: a?.broken ?? null, warning: healthOf(liveOf(id), alertsOf(id).filter((x) => !x.resolvedAt), now) === "warning" };
     })
     .sort(
       (a, b) =>
@@ -282,57 +315,25 @@ export default function Dashboard() {
         a.id.localeCompare(b.id),
     );
 
-  const selected = picked && ids.includes(picked) ? picked : (rows[0]?.id ?? null);
-  const count = (st: ActivityState) => rows.filter((r) => r.state === st).length;
-  const brokenCount = rows.filter((r) => r.broken).length;
+  const selected = picked && ids.includes(picked) ? picked : null;
   const apiDown = live.error !== null && activity.error !== null;
   const noStatus = activity.error ? "Unknown" : activity.data ? "Nothing stored" : "Checking";
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-7xl flex-wrap items-baseline justify-between gap-x-8 gap-y-1 px-6 py-4">
-          <h1 className="text-[15px] font-semibold tracking-tight">SmolBugs</h1>
-          <p className="text-sm text-slate-600">
-            {rows.length === 0
-              ? "No machines registered yet"
-              : `${count("online")} online, ${count("idle")} idle, ${count("offline")} offline`}
-            {brokenCount > 0 && (
-              <span className="ml-2 font-medium text-red-700">
-                {brokenCount} broken
-              </span>
-            )}
+    <div className="min-h-screen bg-cool text-navy lg:flex">
+      <Sidebar rows={rows} selected={selected} onSelect={setPicked} infoOf={infoOf} noStatus={noStatus} />
+
+      <main className="min-w-0 flex-1 space-y-6 px-5 py-6 lg:px-8">
+        {apiDown && (
+          <p role="alert" className="rounded-md bg-amber px-4 py-2 text-sm font-medium text-navy">
+            Server not reachable. Showing the last data received.
           </p>
-        </div>
-      </header>
-
-      {apiDown && (
-        <p role="alert" className="border-b border-red-200 bg-red-50 px-6 py-2 text-center text-sm text-red-800">
-          Lost contact with the SmolBugs server ({activity.error}). Showing the last data received.
-        </p>
-      )}
-
-      {activity.error && !apiDown && (
-        <p role="alert" className="border-b border-amber-200 bg-amber-50 px-6 py-2 text-center text-sm text-amber-900">
-          Can&apos;t read machine status from the database (/api/v1/activity: {activity.error}). Check the terminal
-          running npm run dev for the error.
-        </p>
-      )}
-
-      <div className="mx-auto max-w-7xl space-y-8 px-6 py-8">
-        {rows.length > 0 && <BrokenPanel rows={rows} infoOf={infoOf} activityOf={activityOf} onSelect={setPicked} now={now} />}
-
-        <Fleet
-          rows={rows}
-          selected={selected}
-          onSelect={setPicked}
-          now={now}
-          liveOf={liveOf}
-          infoOf={infoOf}
-          activityOf={activityOf}
-          noStatus={noStatus}
-          limits={live.data?.limits ?? null}
-        />
+        )}
+        {activity.error && !apiDown && (
+          <p role="alert" className="rounded-md bg-amber px-4 py-2 text-sm text-navy">
+            Database status unavailable ({activity.error}).
+          </p>
+        )}
 
         {selected ? (
           <MachineView
@@ -340,176 +341,315 @@ export default function Dashboard() {
             id={selected}
             now={now}
             live={liveOf(selected)}
-            limits={liveOf(selected)?.limits ?? live.data?.limits ?? null}
+            limits={limitsOf(selected)}
             info={infoOf(selected)}
             alerts={alertsOf(selected)}
             activity={activityOf(selected)}
+            abnormalLine={activity.data?.abnormal_above_mm_s ?? null}
             noStatus={noStatus}
+            onBack={() => setPicked(null)}
           />
         ) : (
-          <p className="border border-dashed border-slate-300 bg-white px-6 py-12 text-center text-sm text-slate-500">
-            Machines appear here as soon as they send their first reading. To try it without hardware, run{" "}
-            <code className="rounded bg-slate-100 px-1 py-0.5">npm run fake-fleet</code>.
-          </p>
+          <Overview
+            rows={rows}
+            now={now}
+            infoOf={infoOf}
+            liveOf={liveOf}
+            limitsOf={limitsOf}
+            alerts={alerts.data?.alerts ?? []}
+            activityOf={activityOf}
+            loading={activity.data === null && activity.error === null}
+            onSelect={setPicked}
+            noStatus={noStatus}
+          />
         )}
-      </div>
+      </main>
     </div>
   );
 }
 
-// ---------------------------------------------------------------- fleet table
+// ---------------------------------------------------------------- sidebar
 
-type FleetRow = { id: string; state: ActivityState | null; broken: Broken | null };
+type FleetRow = { id: string; state: ActivityState | null; broken: Broken | null; warning: boolean };
 
-// The space for broken machines: always on screen, so "nothing is broken" is visible too.
-function BrokenPanel(props: {
+function Sidebar(props: {
   rows: FleetRow[];
+  selected: string | null;
+  onSelect: (id: string | null) => void;
   infoOf: (id: string) => MachineRow | null;
-  activityOf: (id: string) => ActivityRow | null;
-  onSelect: (id: string) => void;
-  now: number;
+  noStatus: string;
 }) {
-  const broken = props.rows.filter((r) => r.broken !== null);
-  const many = broken.length > 1;
+  const { rows, selected, onSelect, infoOf, noStatus } = props;
+  const itemClass = (on: boolean) =>
+    `flex w-full items-center justify-between gap-3 px-5 py-2.5 text-left focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-amber ${
+      on ? "bg-cool/10 shadow-[inset_3px_0_0_var(--color-cool)]" : "hover:bg-cool/5"
+    }`;
   return (
-    <section
-      aria-labelledby="broken-heading"
-      className={broken.length ? "border border-red-300 bg-red-50" : "border border-slate-200 bg-white"}
-    >
-      <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1 px-5 py-3">
-        <h2 id="broken-heading" className={`font-semibold ${broken.length ? "text-red-800" : ""}`}>
-          Broken
-        </h2>
-        <p className={`text-sm ${broken.length ? "text-red-800" : "text-slate-500"}`}>
-          {broken.length === 0
-            ? "No machines are broken."
-            : `${broken.length} ${many ? "machines need" : "machine needs"} inspection before the next run.`}
-        </p>
+    <aside className="flex flex-col bg-navy text-cool lg:sticky lg:top-0 lg:h-screen lg:w-64 lg:shrink-0">
+      <div className="border-b-2 border-amber px-5 pt-5 pb-4">
+        <p className="text-[28px] leading-none font-normal tracking-[-0.01em]">MachineGuard</p>
       </div>
-      {broken.length > 0 && (
-        <ul className="border-t border-red-200">
-          {broken.map(({ id, state, broken: b }) => {
-            const info = props.infoOf(id);
-            const act = props.activityOf(id);
-            if (!b) return null;
+
+      <nav aria-label="Machines" className="flex-1 overflow-y-auto py-3 max-lg:max-h-80">
+        <button onClick={() => onSelect(null)} aria-current={selected === null ? "page" : undefined} className={itemClass(selected === null)}>
+          <span className="text-[15px]">Overview</span>
+          <span className="text-xs text-cool/75">{rows.length}</span>
+        </button>
+
+        <p className="px-5 pt-4 pb-2 text-xs text-cool/70">Machines</p>
+        {rows.length === 0 && <p className="px-5 text-sm text-cool/75">None yet</p>}
+        <ul>
+          {rows.map(({ id, state, broken }) => {
+            const info = infoOf(id);
             return (
-              <li key={id} className="border-b border-red-200 last:border-b-0">
-                <button
-                  onClick={() => props.onSelect(id)}
-                  className="grid w-full grid-cols-1 items-baseline gap-x-6 gap-y-1 px-5 py-3 text-left hover:bg-red-100/60 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-red-800 md:grid-cols-[minmax(180px,1.4fr)_2fr_auto]"
-                >
-                  <span>
-                    <span className="block font-medium text-red-900">{info?.name ?? id}</span>
-                    <span className="block text-xs text-red-800/80">{id}</span>
-                  </span>
-                  <span className="text-sm text-red-900">
-                    <span className="font-medium">{BROKEN_TITLE[b.kind] ?? capitalise(b.kind.replace(/_/g, " "))}</span>
-                    {": "}
-                    {brokenDetail(b).toLowerCase()}
-                  </span>
-                  <span className="text-sm text-red-800/80 md:text-right">
-                    Since {clock(b.since)}
-                    {state && `, now ${STATE[state].label.toLowerCase()}`}
-                    {state === "offline" && act?.last_received_at ? ` (last data ${ago(props.now, act.last_received_at)} ago)` : ""}
+              <li key={id}>
+                <button onClick={() => onSelect(id)} aria-current={id === selected ? "page" : undefined} className={itemClass(id === selected)}>
+                  <span className="min-w-0">
+                    <span className="block truncate text-[15px]">{info?.name ?? id}</span>
+                    <span className="flex items-center gap-1.5 text-xs text-cool/75">
+                      <span className={`h-1.5 w-1.5 rounded-full ${state ? STATE[state].sideDot : "bg-cool/30"}`} aria-hidden />
+                      {state ? STATE[state].label : noStatus}
+                      {broken && <span className="ml-1 rounded-sm bg-amber px-1 text-[10px] font-semibold text-navy">Broken</span>}
+                    </span>
                   </span>
                 </button>
               </li>
             );
           })}
         </ul>
-      )}
-    </section>
+      </nav>
+    </aside>
   );
 }
 
-function Fleet(props: {
+// ---------------------------------------------------------------- overview
+
+function Overview(props: {
   rows: FleetRow[];
-  selected: string | null;
-  onSelect: (id: string) => void;
   now: number;
-  liveOf: (id: string) => LiveMachine | undefined;
   infoOf: (id: string) => MachineRow | null;
+  liveOf: (id: string) => LiveMachine | undefined;
+  limitsOf: (id: string) => Limits | null;
+  alerts: AlertRow[];
   activityOf: (id: string) => ActivityRow | null;
+  loading: boolean;
+  onSelect: (id: string) => void;
   noStatus: string;
-  limits: Limits | null;
 }) {
-  const { rows, selected, onSelect, now, liveOf, infoOf, activityOf, noStatus, limits } = props;
-  if (rows.length === 0) return null;
-  const cols = "grid grid-cols-[1fr_auto] items-center gap-x-6 md:grid-cols-[minmax(180px,1.4fr)_120px_1fr_1fr_96px]";
+  const { rows, now, infoOf, liveOf, limitsOf, alerts, activityOf, loading, onSelect, noStatus } = props;
+  if (rows.length === 0 && loading) {
+    return <p className="px-1 py-12 text-lg text-navy/70">Loading machines…</p>;
+  }
+  if (rows.length === 0) {
+    return (
+      <p className="rounded-lg border border-dashed border-line bg-white px-6 py-12 text-center text-sm text-navy/70">
+        No machines yet. Start the gateway or run <code className="rounded bg-cool px-1 py-0.5">npm run fake-fleet</code>.
+      </p>
+    );
+  }
+  const open = alerts
+    .filter((a) => a.resolvedAt === null)
+    .sort((a, b) => Number(b.severity === "alert") - Number(a.severity === "alert") || a.createdAt.localeCompare(b.createdAt));
+  const offline = rows.filter((r) => r.state === "offline").length;
+  const attention = rows.filter((r) => r.broken).length;
 
   return (
-    <section aria-labelledby="fleet-heading" className="border border-slate-200 bg-white">
-      <h2 id="fleet-heading" className="sr-only">
-        Machines
-      </h2>
-      <div className={`${cols} border-b border-slate-200 px-5 py-2.5 text-xs text-slate-500 max-md:hidden`}>
-        <span>Machine</span>
-        <span>Status</span>
-        <span>Temperature</span>
-        <span>Vibration</span>
-        <span className="text-right">Last stored</span>
-      </div>
-      <ul>
-        {rows.map(({ id, state, broken }) => {
-          const live = liveOf(id);
-          const act = activityOf(id);
-          const info = infoOf(id);
-          const points = live?.recent ?? [];
-          const last = points.at(-1);
-          const temp = tempSeries(points);
-          const lim = live?.limits ?? limits;
-          const vib = spreadSeries(points, lim?.vibration_window ?? 20);
-          const isSel = id === selected;
-          return (
-            <li key={id} className="border-b border-slate-100 last:border-b-0">
-              <button
-                onClick={() => onSelect(id)}
-                aria-current={isSel ? "true" : undefined}
-                className={`${cols} relative w-full px-5 py-3 text-left focus-visible:z-10 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-slate-900 ${
-                  isSel ? "bg-slate-50" : "hover:bg-slate-50/70"
-                }`}
-              >
-                <span
-                  className={`absolute inset-y-0 left-0 w-1 ${broken ? "bg-red-600" : state ? STATE[state].bar : "bg-slate-200"}`}
-                  aria-hidden
-                />
-                <span className="min-w-0">
-                  <span className="block truncate font-medium">{info?.name ?? id}</span>
-                  <span className="block text-xs text-slate-500">
-                    {id}
-                    {kindText(info) ? `, ${kindText(info)}` : ""}
-                  </span>
-                </span>
-                <span className="text-sm">
-                  <span className={`flex items-center gap-1.5 font-medium ${state ? STATE[state].text : "text-slate-500"}`}>
-                    <span className={`h-2 w-2 rounded-full ${state ? STATE[state].dot : "bg-slate-300"}`} aria-hidden />
-                    {state ? STATE[state].label : noStatus}
-                  </span>
-                  {broken && <span className="block text-xs font-medium text-red-700">Broken</span>}
-                </span>
-                <Reading value={temp.at(-1)?.v} digits={1} unit="°C" points={temp} limit={lim?.temp_max_c ?? null} />
-                <Reading value={vib.at(-1)?.v} digits={3} unit="g" points={vib} limit={lim?.vibration_std_max_g ?? null} />
-                <span className="text-right text-sm tabular-nums text-slate-500 max-md:hidden">
-                  {act?.last_received_at ? `${ago(now, act.last_received_at)} ago` : last ? `${ago(now, last.t)} ago` : "never"}
-                </span>
-              </button>
+    <div className="space-y-8">
+      {/* One sentence instead of a row of number cards */}
+      <header>
+        <h1 className="text-4xl leading-[1.1] font-normal tracking-[-0.02em] sm:text-5xl">
+          {attention === 0
+            ? "All machines within limits"
+            : `${attention} of ${rows.length} ${rows.length === 1 ? "machine" : "machines"} ${attention === 1 ? "needs" : "need"} attention`}
+        </h1>
+        <p className="mt-3 text-lg text-navy/70">
+          {rows.length} monitored
+          {offline > 0 && <>, {offline} not reporting</>}
+        </p>
+      </header>
+
+      {/* Action items: what's wrong, the sign, and what to check first */}
+      {open.length > 0 && (
+        <section aria-labelledby="actions-heading" className="rounded-lg bg-white ring-2 ring-amber">
+          <h2 id="actions-heading" className="border-b border-line/70 px-5 py-3 text-[17px] font-medium">
+            Needs attention
+          </h2>
+          <ul className="divide-y divide-line/60">
+            {open.map((a) => (
+              <li key={a.id}>
+                <button
+                  onClick={() => onSelect(a.machineId)}
+                  className="grid w-full gap-x-6 gap-y-3 px-5 py-4 text-left hover:bg-cool/50 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-navy sm:grid-cols-2 xl:grid-cols-[minmax(140px,1fr)_minmax(160px,1fr)_minmax(0,2fr)_minmax(0,2fr)]"
+                >
+                  <ReportField label="Machine" value={infoOf(a.machineId)?.name ?? a.machineId} note={`since ${when(a.createdAt, now)}`} />
+                  <ReportField label="Fault" value={eventTitle(a)} strong />
+                  <ReportField label="Sign" value={eventDetail(a)} />
+                  <ReportField label="Do" value={SUGGESTED_CHECK[a.kind] ?? "Inspect the machine"} />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {/* The machine board: the one bold element on the page */}
+      <section aria-label="Machines">
+        <ul className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-3">
+          {rows.map((r) => (
+            <li key={r.id}>
+              <MachineTile
+                row={r}
+                now={now}
+                info={infoOf(r.id)}
+                live={liveOf(r.id)}
+                limits={limitsOf(r.id)}
+                activity={activityOf(r.id)}
+                noStatus={noStatus}
+                onSelect={() => onSelect(r.id)}
+              />
             </li>
-          );
-        })}
-      </ul>
-    </section>
+          ))}
+        </ul>
+      </section>
+    </div>
   );
 }
 
-function Reading(props: { value: number | undefined; digits: number; unit: string; points: Point[]; limit: number | null }) {
-  const over = props.limit !== null && props.value !== undefined && props.value > props.limit;
+// One labelled field of the action-item report (deck: 13 pt caps label, 14 pt value).
+function ReportField(props: { label: string; value: string; strong?: boolean; note?: string }) {
   return (
-    <span className="flex items-center gap-3 max-md:hidden">
-      <span className={`w-20 shrink-0 text-sm tabular-nums ${over ? "font-medium text-red-700" : ""}`}>
-        {props.value === undefined ? "—" : `${props.value.toFixed(props.digits)} ${props.unit}`}
-      </span>
-      <Sparkline points={props.points} limit={props.limit} />
+    <span className="block">
+      <span className="block text-xs text-navy/70">{props.label}</span>
+      <span className={`block text-sm ${props.strong ? "font-bold text-amber-ink" : ""}`}>{props.value}</span>
+      {props.note && <span className="block text-[13px] text-navy/70">{props.note}</span>}
     </span>
+  );
+}
+
+// One machine on the board. A broken machine gets an amber strip with when it broke,
+// the fault in amber and what to check; an offline one fades to a dashed outline,
+// so a silent sensor never looks like a healthy machine.
+function MachineTile(props: {
+  row: FleetRow;
+  now: number;
+  info: MachineRow | null;
+  live: LiveMachine | undefined;
+  limits: Limits | null;
+  activity: ActivityRow | null;
+  noStatus: string;
+  onSelect: () => void;
+}) {
+  const { row, now, info, live, limits, activity, noStatus, onSelect } = props;
+  const run = activity?.run_state ?? null;
+  const mmS = run ? activity?.vibration_mm_s ?? null : null; // only a fresh window says anything about now
+  const pts = live?.recent ?? [];
+  const vib = spreadSeries(pts, limits?.vibration_window ?? 20);
+  const temp = tempSeries(pts).at(-1)?.v;
+  const vibNow = vib.at(-1)?.v;
+  const last = pts.at(-1);
+  const broken = row.broken;
+  const offline = row.state === "offline" || row.state === null;
+  const tempOver = limits !== null && temp !== undefined && temp > limits.temp_max_c;
+  const vibOver = run === "abnormal" || (limits !== null && vibNow !== undefined && vibNow > limits.vibration_std_max_g);
+
+  const condition = broken
+    ? (BROKEN_TITLE[broken.kind] ?? "Broken")
+    : offline
+      ? "No signal"
+      : run
+        ? RUN_TEXT[run].label
+        : row.warning
+          ? "Outside a limit"
+          : row.state === "idle"
+            ? "Idle"
+            : "Running";
+  const conditionTone = broken || row.warning || run === "abnormal"
+    ? "text-amber-ink"
+    : run
+      ? RUN_TEXT[run].tone
+      : row.state === "online"
+        ? "text-emerald-700"
+        : row.state === "idle"
+          ? "text-steel"
+          : "text-navy/70";
+  const surface = broken
+    ? "bg-white ring-2 ring-amber"
+    : offline
+      ? "border border-dashed border-navy/25 hover:bg-white/50"
+      : "bg-white hover:ring-1 hover:ring-line";
+
+  return (
+    <button
+      onClick={onSelect}
+      className={`flex h-full w-full flex-col overflow-hidden rounded-lg text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-navy ${surface}`}
+    >
+      {broken && (
+        <span className="flex items-center justify-between gap-4 bg-amber px-5 py-1.5 text-sm text-navy">
+          <span className="font-bold">Broken</span>
+          <span className="text-xs">since {when(broken.since, now)}</span>
+        </span>
+      )}
+
+      <span className="flex flex-1 flex-col p-5">
+        <span className="flex items-start justify-between gap-4">
+          <span className="min-w-0">
+            <span className="block truncate text-xl font-normal">{info?.name ?? row.id}</span>
+            <span className="block text-xs text-navy/70">{row.id}</span>
+          </span>
+          <span className={`flex shrink-0 items-center gap-1.5 text-sm ${row.state ? STATE[row.state].text : "text-navy/70"}`}>
+            <span className={`h-2 w-2 rounded-full ${row.state ? STATE[row.state].dot : "bg-navy/25"}`} aria-hidden />
+            {row.state ? STATE[row.state].label : noStatus}
+          </span>
+        </span>
+
+        <span className="mt-4 flex items-end justify-between gap-4">
+          <span className="min-w-0">
+            <span className={`block text-2xl leading-tight font-normal tracking-[-0.01em] ${conditionTone}`}>{condition}</span>
+            {broken && SUGGESTED_CHECK[broken.kind] && (
+              <span className="mt-1 block text-[15px] text-navy/80">{SUGGESTED_CHECK[broken.kind]}</span>
+            )}
+          </span>
+          <span className="w-28 shrink-0">
+            {vib.length > 1 && <TileTrace points={vib} limit={limits?.vibration_std_max_g ?? null} />}
+          </span>
+        </span>
+
+        <span className="mt-auto pt-4">
+          <span className="grid grid-cols-3 gap-4 border-t border-line/70 pt-3">
+            <TileStat label="Temperature" value={temp === undefined ? "–" : `${temp.toFixed(1)} °C`} over={tempOver} />
+            <TileStat label="Vibration" value={mmS === null ? "–" : `${mmS.toFixed(1)} mm/s`} over={vibOver} />
+            <TileStat label="Updated" value={last ? `${ago(now, last.t)} ago` : "never"} align="right" />
+          </span>
+        </span>
+      </span>
+    </button>
+  );
+}
+
+function TileStat(props: { label: string; value: string; over?: boolean; align?: "right" }) {
+  return (
+    <span className={props.align === "right" ? "text-right" : ""}>
+      <span className="block text-xs text-navy/70">{props.label}</span>
+      <span className={`block text-[15px] tabular-nums ${props.over ? "font-medium text-amber-ink" : ""}`}>
+        {props.value}
+        {props.over && <span className="sr-only"> (over limit)</span>}
+      </span>
+    </span>
+  );
+}
+
+// The last minute of vibration, drawn small, with the limit as a dashed line.
+function TileTrace({ points, limit }: { points: Point[]; limit: number | null }) {
+  const W = 112;
+  const H = 40;
+  const s = scale(points, limit, H, W);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="block h-10 w-full" aria-hidden>
+      {limit !== null && limit >= s.lo && limit <= s.hi && (
+        <line x1={0} x2={W} y1={s.y(limit)} y2={s.y(limit)} stroke="#F2A541" strokeDasharray="3 3" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+      )}
+      <path d={s.path} fill="none" stroke="#102A35" strokeWidth={1.5} vectorEffect="non-scaling-stroke" strokeLinejoin="round" />
+    </svg>
   );
 }
 
@@ -523,9 +663,12 @@ function MachineView(props: {
   info: MachineRow | null;
   alerts: AlertRow[];
   activity: ActivityRow | null;
+  abnormalLine: number | null;
   noStatus: string;
+  onBack: () => void;
 }) {
-  const { id, now, live, limits, info, alerts, activity, noStatus } = props;
+  const { id, now, live, limits, info, alerts, activity, abnormalLine, noStatus } = props;
+  const run = activity?.run_state ?? null;
   const open = alerts.filter((a) => a.resolvedAt === null);
   const points = live?.recent ?? [];
   const last = points.at(-1);
@@ -533,176 +676,195 @@ function MachineView(props: {
   const state = activity?.state ?? null;
   const broken = activity?.broken ?? null;
   const headline = broken
-    ? `${BROKEN_TITLE[broken.kind] ?? capitalise(broken.kind.replace(/_/g, " "))}: ${brokenDetail(broken).toLowerCase()}. Inspect before the next run.`
+    ? `${BROKEN_TITLE[broken.kind] ?? capitalise(broken.kind.replace(/_/g, " "))}: ${brokenDetail(broken).toLowerCase()}`
     : state === "offline"
-      ? `${activity?.reason ?? "No data"}. Check the sensor node and the gateway.`
-      : state === "idle"
-        ? "Connected and sending data, but the machine isn't running."
-        : state === "online"
-          ? health === "warning"
-            ? summary(health, last, open)
-            : "Running and sending data. All readings are within limits."
-          : "Checking the database for this machine's data.";
+      ? activity?.last_received_at
+        ? `No data for ${ago(now, activity.last_received_at)}`
+        : "No data stored yet"
+      : run
+        ? (activity?.run_state_text ?? RUN_TEXT[run].label)
+        : state === "idle"
+          ? "Connected, not running"
+          : state === "online"
+            ? health === "warning"
+              ? summary(health, last, open).replace(/\.$/, "")
+              : "Running normally"
+            : "";
   const [range, setRange] = useState<"live" | "10m">("live");
 
-  const history = usePoll<{ status: StatusRow[] }>(
-    range === "10m" ? `/api/v1/machines/${encodeURIComponent(id)}/readings?minutes=10` : null,
-    15_000,
+  // The last 10 minutes from the database: stored temperatures (10-minute view) and every
+  // vibration window (the vibration chart, always shown).
+  const history = usePoll<{ status: StatusRow[]; windows: WindowRow[] }>(
+    `/api/v1/machines/${encodeURIComponent(id)}/readings?minutes=10`,
+    10_000,
   );
+  const stored = history.data?.status ?? [];
+  const vibLevel = (history.data?.windows ?? [])
+    .filter((w) => w.velocityRmsMmS !== null)
+    .map((w) => ({ t: Date.parse(w.receivedAt), v: w.velocityRmsMmS as number }));
+  const mmS = run ? (activity?.vibration_mm_s ?? null) : null;
+  const freq = run ? (activity?.main_freq_hz ?? null) : null;
   const tempLive = tempSeries(points);
-  const tempStored = (history.data?.status ?? [])
-    .filter((s) => s.temperatureC !== null)
-    .map((s) => ({ t: Date.parse(s.receivedAt), v: s.temperatureC as number }));
+  const tempStored = stored.filter((s) => s.temperatureC !== null).map((s) => ({ t: Date.parse(s.receivedAt), v: s.temperatureC as number }));
   const vib = spreadSeries(points, limits?.vibration_window ?? 20);
   const a = last?.accel ?? null;
   const fft = info?.latestWindow ?? null;
   const flags = new Set(last?.flags ?? []);
+  const tempBad = flags.has("temp_high") || flags.has("temp_rising");
+  const vibBad = run === "abnormal" || flags.has("vibration_high") || flags.has("shock");
 
   return (
-    <section aria-labelledby="machine-heading" className="grid gap-8 lg:grid-cols-[minmax(0,2fr)_minmax(280px,1fr)]">
-      <div className="border border-slate-200 bg-white">
-        {/* Condition: the one loud element on the page */}
-        <div className="relative border-b border-slate-200 py-5 pr-6 pl-7">
-          <span
-            className={`absolute inset-y-0 left-0 w-1.5 ${broken ? "bg-red-600" : state ? STATE[state].bar : "bg-slate-200"}`}
-            aria-hidden
-          />
-          <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
-            <h2 id="machine-heading" className="text-xl font-semibold tracking-tight">
+    <div className="space-y-6">
+      <button onClick={props.onBack} className="text-sm text-navy/70 hover:text-navy">
+        ← Overview
+      </button>
+
+      {/* Machine */}
+      <section aria-labelledby="machine-heading" className={`rounded-lg bg-white px-6 py-5 ${broken ? "ring-2 ring-amber" : ""}`}>
+        <div className="flex flex-wrap items-center justify-between gap-x-8 gap-y-3">
+          <div>
+            <h2 id="machine-heading" className="text-[28px] leading-tight font-normal tracking-[-0.01em]">
               {info?.name ?? id}
             </h2>
-            <p className="text-sm text-slate-500">
+            <p className="text-xs text-navy/70">
               {id}
               {kindText(info) ? `, ${kindText(info)}` : ""}
               {info?.rpm ? `, ${info.rpm.toLocaleString()} rpm` : ""}
             </p>
           </div>
-          <p className="mt-3 flex flex-wrap items-baseline gap-x-4 text-3xl font-semibold tracking-tight">
-            {broken && <span className="text-red-700">Broken</span>}
-            <span className={broken ? `text-xl ${state ? STATE[state].text : "text-slate-500"}` : state ? STATE[state].text : "text-slate-500"}>
-              {state ? STATE[state].label : noStatus}
-            </span>
-          </p>
-          <p className="mt-1 text-slate-700">{headline}</p>
-          {broken && <p className="mt-1 text-sm text-slate-500">Broken since {clock(broken.since)}</p>}
+          <div className="flex items-center gap-6">
+            <div className="flex flex-col items-end gap-1.5">
+              <span className={`flex items-center gap-1.5 rounded-sm bg-cool px-2.5 py-1 text-sm font-medium ${state ? STATE[state].text : "text-navy/70"}`}>
+                <span className={`h-2 w-2 rounded-full ${state ? STATE[state].dot : "bg-navy/25"}`} aria-hidden />
+                {state ? STATE[state].label : noStatus}
+              </span>
+              {broken && <span className="rounded-sm bg-amber px-2.5 py-1 text-sm font-semibold text-navy">Broken</span>}
+            </div>
+          </div>
         </div>
+        {headline && <p className={`mt-2 text-sm ${broken ? "text-amber-ink" : "text-navy/75"}`}>{headline}</p>}
+        {broken && SUGGESTED_CHECK[broken.kind] && (
+          <p className="mt-1 text-sm text-navy/75">
+            <span className="font-medium">Suggested check:</span> {SUGGESTED_CHECK[broken.kind]}
+          </p>
+        )}
+      </section>
 
-        {/* Temperature */}
-        <Measure
+      {/* Readings */}
+      <div className="grid gap-6 xl:grid-cols-2">
+        <Box
           title="Temperature"
-          value={tempLive.at(-1)?.v}
-          digits={1}
-          unit="°C"
-          limitText={limits ? `Limit ${limits.temp_max_c} °C, or a rise faster than ${limits.temp_rise_c_per_min} °C/min` : null}
-          bad={flags.has("temp_high") || flags.has("temp_rising")}
-          control={
+          tone={tempBad ? "danger" : undefined}
+          action={
             <Segmented
               value={range}
               onChange={setRange}
               options={[
-                { value: "live", label: "Last minute" },
-                { value: "10m", label: "Last 10 min" },
+                { value: "live", label: "1 min" },
+                { value: "10m", label: "10 min" },
               ]}
             />
           }
         >
+          <Big value={tempLive.at(-1)?.v} digits={1} unit="°C" bad={tempBad} />
           {range === "live" ? (
-            <Chart points={tempLive} limit={limits?.temp_max_c ?? null} limitLabel={limits ? `${limits.temp_max_c} °C` : ""} span="1 min" />
+            <Chart points={tempLive} limit={limits?.temp_max_c ?? null} limitLabel={limits ? `${limits.temp_max_c} °C` : ""} span="1 min" minSpan={4} />
           ) : tempStored.length > 1 ? (
-            <Chart points={tempStored} limit={limits?.temp_max_c ?? null} limitLabel={limits ? `${limits.temp_max_c} °C` : ""} span="10 min" />
+            <Chart points={tempStored} limit={limits?.temp_max_c ?? null} limitLabel={limits ? `${limits.temp_max_c} °C` : ""} span="10 min" minSpan={4} />
           ) : (
-            <Empty>Stored readings appear here within a few seconds.</Empty>
+            <Empty>No stored readings yet</Empty>
           )}
-        </Measure>
+        </Box>
 
-        {/* Vibration */}
-        <Measure
-          title="Vibration"
-          value={vib.at(-1)?.v}
-          digits={3}
-          unit="g"
-          limitText={
-            limits
-              ? `Limit ${limits.vibration_std_max_g} g. Spread of the last ${limits.vibration_window} accelerometer readings; relative, not calibrated.`
-              : null
-          }
-          bad={flags.has("vibration_high") || flags.has("shock")}
-        >
-          <Chart points={vib} limit={limits?.vibration_std_max_g ?? null} limitLabel={limits ? `${limits.vibration_std_max_g} g` : ""} span="1 min" />
-          <dl className="mt-4 grid grid-cols-4 gap-4 text-sm">
-            <Stat label="X" value={a ? `${a.x.toFixed(3)} g` : "—"} />
-            <Stat label="Y" value={a ? `${a.y.toFixed(3)} g` : "—"} />
-            <Stat label="Z" value={a ? `${a.z.toFixed(3)} g` : "—"} />
-            <Stat label="Total (≈1 g at rest)" value={a ? `${Math.hypot(a.x, a.y, a.z).toFixed(2)} g` : "—"} />
-          </dl>
-        </Measure>
+        <Box title="Vibration" tone={vibBad ? "danger" : undefined}>
+          <Big value={mmS ?? undefined} digits={1} unit="mm/s" bad={vibBad} note={freq !== null ? `main frequency ${Math.round(freq)} Hz` : undefined} />
+          {vibLevel.length > 1 ? (
+            <Chart
+              points={vibLevel}
+              limit={abnormalLine}
+              limitLabel={abnormalLine !== null ? `${abnormalLine} mm/s` : ""}
+              span="10 min"
+              minSpan={10}
+              floor={0}
+              alwaysLimit
+            />
+          ) : (
+            <Empty>The vibration level appears here once the sensor sends its first 10-second clip.</Empty>
+          )}
+        </Box>
       </div>
 
-      <aside className="space-y-8">
-        <Side title="Events">
-          {alerts.length === 0 ? (
-            <Empty>Alerts for this machine will be listed here.</Empty>
-          ) : (
-            <ol className="relative space-y-4 border-l border-slate-200 pl-5">
-              {alerts.slice(0, 8).map((e) => (
-                <li key={e.id} className="relative">
-                  <span
-                    aria-hidden
-                    className={`absolute top-1.5 -left-[25px] h-2.5 w-2.5 rounded-full ring-2 ring-white ${
-                      e.resolvedAt ? "bg-slate-300" : e.severity === "alert" ? "bg-red-600" : "bg-amber-500"
-                    }`}
-                  />
-                  <p className="text-sm">
-                    <span className="font-medium">{eventTitle(e)}</span>
-                    <span className="text-slate-500">, {clock(e.createdAt)}</span>
-                  </p>
-                  <p className="text-sm text-slate-600">{eventDetail(e)}</p>
-                  <p className="text-xs text-slate-500">
-                    {e.resolvedAt ? `Back to normal at ${clock(e.resolvedAt)}` : "Still open"}
-                  </p>
-                </li>
-              ))}
-            </ol>
-          )}
-        </Side>
+      <Box title="Events" variant="quiet">
+        {alerts.length === 0 ? (
+          <Empty>No events</Empty>
+        ) : (
+          <ol className="divide-y divide-line/60">
+            {alerts.slice(0, 8).map((e) => (
+              <li key={e.id} className="flex flex-wrap items-center gap-x-4 gap-y-0.5 py-2 text-sm first:pt-0 last:pb-0">
+                <span
+                  aria-hidden
+                  className={`h-2.5 w-2.5 shrink-0 rounded-full ${e.resolvedAt ? "bg-navy/25" : e.severity === "alert" ? "bg-amber" : "bg-amber/60"}`}
+                />
+                <span className="font-medium sm:w-44 sm:shrink-0">{eventTitle(e)}</span>
+                <span className="min-w-0 text-navy/70 max-sm:order-last max-sm:basis-full max-sm:pl-6 sm:flex-1">{eventDetail(e)}</span>
+                <span className="shrink-0 text-xs text-navy/70 tabular-nums">
+                  {when(e.createdAt, now)}
+                  {e.resolvedAt ? ` to ${when(e.resolvedAt, now, e.createdAt)}` : ", still open"}
+                </span>
+              </li>
+            ))}
+          </ol>
+        )}
+      </Box>
 
-        <Side title="Monitoring">
-          <dl className="divide-y divide-slate-100 text-sm">
-            <Row label="Status (from database)" value={state ? STATE[state].label : noStatus} bad={state === "offline" || !state} />
+      {/* For whoever set the sensor up: folded away so the readings stay the first thing you see */}
+      <details className="group rounded-lg bg-white/55">
+        <summary className="cursor-pointer list-none px-5 py-4 text-[17px] text-navy/70 hover:text-navy">
+          <span className="mr-2 inline-block transition-transform group-open:rotate-90" aria-hidden>›</span>
+          Diagnostics
+        </summary>
+      <div className="grid gap-6 px-5 pb-5 md:grid-cols-2 xl:grid-cols-3">
+        <Box title="Database info" variant="quiet">
+          <dl className="divide-y divide-line/60 text-[15px]">
+            <Row label="Saved to database" value={live?.last_flush_at ? `${ago(now, live.last_flush_at)} ago` : "Not yet"} bad={live?.last_error != null} />
+            <Row label="Waiting to be saved" value={live ? String(live.buffered) : "—"} />
             <Row
               label="Last stored in database"
               value={activity?.last_received_at ? `${ago(now, activity.last_received_at)} ago` : "Never"}
               bad={state === "offline"}
             />
             <Row label="Stored in the last minute" value={activity ? String(activity.readings_last_minute) : "—"} />
-            <Row label="Last reading received" value={last ? `${ago(now, last.t)} ago` : "None yet"} bad={!last || now - Date.parse(last.t) > STALE_MS} />
-            <Row label="Readings in the last minute" value={String(points.filter((p) => now - Date.parse(p.t) < 60_000).length)} />
+            {live?.last_error && <Row label="Save failed" value={live.last_error} bad />}
+            {live && live.dropped > 0 && <Row label="Lost (buffer full)" value={String(live.dropped)} bad />}
+          </dl>
+        </Box>
+
+        <Box title="Sensors" variant="quiet">
+          <dl className="divide-y divide-line/60 text-[15px]">
             <Row label="Temperature sensor" value={sensorState(last?.thermistor_valid, flags.has("thermistor_fault"))} bad={flags.has("thermistor_fault")} />
             <Row label="Accelerometer" value={sensorState(last?.accel_valid, flags.has("accel_fault"))} bad={flags.has("accel_fault")} />
-            <Row label="Saved to database" value={live?.last_flush_at ? `${ago(now, live.last_flush_at)} ago` : "Not yet"} bad={live?.last_error != null} />
-            <Row label="Waiting to be saved" value={live ? String(live.buffered) : "—"} />
-            {live?.last_error && <Row label="Last save failed" value={live.last_error} bad />}
-            {live && live.dropped > 0 && <Row label="Lost while the database was down" value={String(live.dropped)} bad />}
+            <Row label="Last reading" value={last ? `${ago(now, last.t)} ago` : "None"} bad={!last || now - Date.parse(last.t) > STALE_MS} />
+            <Row label="Readings per minute" value={String(points.filter((p) => now - Date.parse(p.t) < 60_000).length)} />
+            <Row label="Accelerometer x, y, z" value={a ? `${a.x.toFixed(2)}, ${a.y.toFixed(2)}, ${a.z.toFixed(2)} g` : "—"} />
+            <Row label="Movement (spread)" value={vib.length ? `${(vib.at(-1) as Point).v.toFixed(3)} g` : "—"} />
           </dl>
-        </Side>
+        </Box>
 
-        <Side title="Frequency analysis">
+        <Box title="Latest vibration window" variant="quiet">
           {fft ? (
-            <dl className="divide-y divide-slate-100 text-sm">
+            <dl className="divide-y divide-line/60 text-[15px]">
               <Row label="Dominant frequency" value={fmt(fft.dominantFreqHz, 1, "Hz")} />
               <Row label="Peak amplitude" value={fmt(fft.dominantAmpG, 3, "g")} />
               <Row label="Velocity RMS" value={fmt(fft.velocityRmsMmS, 2, "mm/s")} />
-              <Row label="Analysed at" value={clock(fft.receivedAt)} />
+              <Row label="Analysed" value={when(fft.receivedAt, now)} />
             </dl>
           ) : (
-            <Empty>
-              Needs full-rate vibration windows from the sensor node. The current firmware sends one accelerometer reading
-              every half second, which shows how much the machine moves but not at what frequency.
-            </Empty>
+            <Empty>No vibration windows from this sensor yet</Empty>
           )}
-        </Side>
-      </aside>
-    </section>
+        </Box>
+      </div>
+      </details>
+    </div>
   );
 }
 
@@ -718,59 +880,50 @@ function eventTitle(e: AlertRow): string {
 function eventDetail(e: AlertRow): string {
   const listed = e.message.replace(/^Outside limits:\s*/, "").split(/,\s*/).filter(Boolean);
   const words = listed.map((f) => FLAG_TEXT[f] ?? f);
-  return words.length ? capitalise(words.join(", ")) + "." : e.message;
+  return words.length ? capitalise(words.join(", ")) : e.message;
 }
 
 // ---------------------------------------------------------------- pieces
 
-function Measure(props: {
-  title: string;
-  value: number | undefined;
-  digits: number;
-  unit: string;
-  limitText: string | null;
-  bad: boolean;
-  control?: ReactNode;
-  children: ReactNode;
-}) {
+// A labelled box grouping related data. "quiet" is for secondary information:
+// lighter and borderless, so the readings stay the first thing you look at.
+function Box(props: { title: string; action?: ReactNode; tone?: "danger"; variant?: "quiet"; children: ReactNode }) {
+  const quiet = props.variant === "quiet";
+  const surface = quiet ? "bg-white/55" : "bg-white";
   return (
-    <div className="border-b border-slate-200 px-6 py-5 last:border-b-0">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h3 className="text-sm text-slate-600">{props.title}</h3>
-          <p className={`mt-0.5 text-2xl font-semibold tabular-nums ${props.bad ? "text-red-700" : ""}`}>
-            {props.value === undefined ? "—" : props.value.toFixed(props.digits)}
-            <span className="ml-1 text-base font-normal text-slate-500">{props.unit}</span>
-          </p>
-        </div>
-        {props.control}
+    <section className={`rounded-lg ${surface}`}>
+      <div className={`flex items-center justify-between gap-4 px-5 ${quiet ? "pt-4 pb-1" : "border-b border-line/70 py-3"}`}>
+        <h3 className={`text-[17px] font-normal ${props.tone === "danger" ? "text-amber-ink" : quiet ? "text-navy/70" : ""}`}>{props.title}</h3>
+        {props.action}
       </div>
-      <div className="mt-4">{props.children}</div>
-      {props.limitText && <p className="mt-2 text-xs text-slate-500">{props.limitText}</p>}
-    </div>
+      <div className={`px-5 ${quiet ? "pb-4" : "py-4"}`}>{props.children}</div>
+    </section>
   );
 }
 
-function Side(props: { title: string; children: ReactNode }) {
+function Big(props: { value: number | undefined; digits: number; unit: string; bad: boolean; note?: string }) {
   return (
-    <section>
-      <h3 className="mb-3 text-sm font-semibold">{props.title}</h3>
-      {props.children}
-    </section>
+    <p className="mb-3 flex items-baseline justify-between gap-4">
+      <span className={`text-5xl leading-none font-normal tracking-[-0.02em] tabular-nums ${props.bad ? "text-amber-ink" : ""}`}>
+        {props.value === undefined ? "—" : props.value.toFixed(props.digits)}
+        <span className="ml-1 text-base font-normal text-navy/70">{props.unit}</span>
+      </span>
+      {props.note && <span className="text-xs text-navy/70">{props.note}</span>}
+    </p>
   );
 }
 
 function Segmented<T extends string>(props: { value: T; onChange: (v: T) => void; options: { value: T; label: string }[] }) {
   return (
-    <div role="radiogroup" className="inline-flex border border-slate-200 text-xs">
+    <div role="radiogroup" className="inline-flex border border-line text-xs">
       {props.options.map((o) => (
         <button
           key={o.value}
           role="radio"
           aria-checked={props.value === o.value}
           onClick={() => props.onChange(o.value)}
-          className={`px-3 py-1.5 focus-visible:outline-2 focus-visible:outline-slate-900 ${
-            props.value === o.value ? "bg-slate-900 text-white" : "bg-white text-slate-600 hover:bg-slate-50"
+          className={`px-3 py-1.5 focus-visible:outline-2 focus-visible:outline-navy ${
+            props.value === o.value ? "bg-navy text-cool" : "bg-white text-navy/70 hover:bg-cool"
           }`}
         >
           {o.label}
@@ -780,35 +933,37 @@ function Segmented<T extends string>(props: { value: T; onChange: (v: T) => void
   );
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <dt className="text-xs text-slate-500">{label}</dt>
-      <dd className="tabular-nums">{value}</dd>
-    </div>
-  );
-}
-
 function Row({ label, value, bad }: { label: string; value: string; bad?: boolean }) {
   return (
     <div className="flex justify-between gap-4 py-2 first:pt-0">
-      <dt className="text-slate-600">{label}</dt>
-      <dd className={`text-right tabular-nums ${bad ? "font-medium text-red-700" : ""}`}>{value}</dd>
+      <dt className="text-navy/70">{label}</dt>
+      <dd className={`text-right tabular-nums ${bad ? "font-medium text-amber-ink" : ""}`}>{value}</dd>
     </div>
   );
 }
 
 function Empty({ children }: { children: ReactNode }) {
-  return <p className="text-sm text-slate-500">{children}</p>;
+  return <p className="text-sm text-navy/70">{children}</p>;
 }
 
 // ---------------------------------------------------------------- charts (plain SVG)
 
-function scale(points: Point[], limit: number | null, height: number, width: number) {
+// minSpan: the smallest range the axis shows, so sensor noise (0.1 °C) isn't blown up into a
+// dramatic zigzag. floor: the axis never goes below it (vibration can't be negative).
+function scale(points: Point[], limit: number | null, height: number, width: number, minSpan = 0, floor?: number, alwaysLimit = false) {
   const values = points.map((p) => p.v);
   let lo = Math.min(...values);
   let hi = Math.max(...values);
-  if (limit !== null && limit <= hi * 1.6) hi = Math.max(hi, limit); // show the limit when it's close
+  if (limit !== null && (alwaysLimit || limit <= hi * 1.6)) hi = Math.max(hi, limit * (alwaysLimit ? 1.1 : 1)); // show the limit when it's close (or always)
+  if (hi - lo < minSpan) {
+    const mid = (hi + lo) / 2;
+    lo = mid - minSpan / 2;
+    hi = mid + minSpan / 2;
+    if (floor !== undefined && lo < floor) {
+      hi += floor - lo;
+      lo = floor;
+    }
+  }
   const pad = (hi - lo) * 0.12 || Math.abs(hi) * 0.05 || 1;
   lo = values.every((v) => v >= 0) ? Math.max(0, lo - pad) : lo - pad;
   hi += pad;
@@ -820,39 +975,24 @@ function scale(points: Point[], limit: number | null, height: number, width: num
   return { lo, hi, y, path };
 }
 
-function Sparkline({ points, limit }: { points: Point[]; limit: number | null }) {
-  const W = 120;
-  const H = 24;
-  if (points.length < 2) return <span className="block h-6 w-full max-w-[160px]" />;
-  const s = scale(points, limit, H, W);
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="block h-6 w-full max-w-[160px]" aria-hidden>
-      {limit !== null && limit >= s.lo && limit <= s.hi && (
-        <line x1={0} x2={W} y1={s.y(limit)} y2={s.y(limit)} stroke="#fca5a5" strokeWidth={1} vectorEffect="non-scaling-stroke" />
-      )}
-      <path d={s.path} fill="none" stroke="#334155" strokeWidth={1.25} vectorEffect="non-scaling-stroke" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
-function Chart(props: { points: Point[]; limit: number | null; limitLabel: string; span: string; height?: number }) {
+function Chart(props: { points: Point[]; limit: number | null; limitLabel: string; span: string; height?: number; minSpan?: number; floor?: number; alwaysLimit?: boolean }) {
   const H = props.height ?? 140;
   const W = 600;
   if (props.points.length < 2) {
     return (
-      <div style={{ height: H }} className="flex items-center justify-center border border-dashed border-slate-200 text-sm text-slate-400">
+      <div style={{ height: H }} className="flex items-center justify-center border border-dashed border-line text-sm text-navy/70">
         Waiting for readings
       </div>
     );
   }
-  const s = scale(props.points, props.limit, H, W);
+  const s = scale(props.points, props.limit, H, W, props.minSpan, props.floor, props.alwaysLimit);
   const limitShown = props.limit !== null && props.limit >= s.lo && props.limit <= s.hi;
   const ticks = [s.hi, (s.hi + s.lo) / 2, s.lo];
   const tickDigits = s.hi - s.lo < 1 ? 3 : 1;
   return (
     <figure>
       <div className="flex gap-3">
-        <div className="relative w-12 shrink-0 text-right text-[11px] tabular-nums text-slate-400" style={{ height: H }} aria-hidden>
+        <div className="relative w-12 shrink-0 text-right text-[11px] tabular-nums text-navy/70" style={{ height: H }} aria-hidden>
           {ticks.map((v, i) => (
             <span key={i} className="absolute right-0 -translate-y-1/2" style={{ top: `${(i / 2) * 100}%` }}>
               {v.toFixed(tickDigits)}
@@ -862,22 +1002,22 @@ function Chart(props: { points: Point[]; limit: number | null; limitLabel: strin
         <div className="relative min-w-0 flex-1">
           <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="block w-full" style={{ height: H }} role="img" aria-label={`Trend over the last ${props.span}`}>
             {[0, 0.5, 1].map((f) => (
-              <line key={f} x1={0} x2={W} y1={f * H} y2={f * H} stroke="#f1f5f9" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+              <line key={f} x1={0} x2={W} y1={f * H} y2={f * H} stroke="#E9F0F2" strokeWidth={1} vectorEffect="non-scaling-stroke" />
             ))}
             {limitShown && (
-              <line x1={0} x2={W} y1={s.y(props.limit as number)} y2={s.y(props.limit as number)} stroke="#dc2626" strokeDasharray="5 4" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+              <line x1={0} x2={W} y1={s.y(props.limit as number)} y2={s.y(props.limit as number)} stroke="#F2A541" strokeDasharray="5 4" strokeWidth={1} vectorEffect="non-scaling-stroke" />
             )}
-            <path d={s.path} fill="none" stroke="#0f172a" strokeWidth={1.75} vectorEffect="non-scaling-stroke" strokeLinejoin="round" />
+            <path d={s.path} fill="none" stroke="#102A35" strokeWidth={1.75} vectorEffect="non-scaling-stroke" strokeLinejoin="round" />
           </svg>
           {limitShown && (
             <span
-              className="absolute right-0 -translate-y-full bg-white/80 pb-0.5 pl-1 text-[11px] text-red-700"
+              className="absolute right-0 -translate-y-full bg-white/80 pb-0.5 pl-1 text-[11px] text-amber-ink"
               style={{ top: `${(s.y(props.limit as number) / H) * 100}%` }}
             >
               Limit {props.limitLabel}
             </span>
           )}
-          <div className="mt-1 flex justify-between text-[11px] text-slate-400" aria-hidden>
+          <div className="mt-1 flex justify-between text-[11px] text-navy/70" aria-hidden>
             <span>{duration(props.points[props.points.length - 1].t - props.points[0].t)} ago</span>
             <span>Now</span>
           </div>
@@ -899,6 +1039,14 @@ function ago(now: number, iso: string): string {
 function duration(ms: number): string {
   const s = Math.round(ms / 1000);
   return s < 90 ? `${s} s` : `${Math.round(s / 60)} min`;
+}
+
+// "5:09:48 PM" today; "Sat 5:09 PM" on another day. `since`: drop the day if it matches.
+function when(iso: string, now: number, since?: string): string {
+  const d = new Date(iso);
+  const sameDay = (x: Date, y: Date) => x.toDateString() === y.toDateString();
+  if (sameDay(d, new Date(now || Date.now())) || (since && sameDay(d, new Date(since)))) return clock(iso);
+  return d.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
 }
 
 function clock(iso: string): string {
