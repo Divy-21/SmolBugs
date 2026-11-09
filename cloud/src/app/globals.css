@@ -1,20 +1,34 @@
 @import "tailwindcss";
 
+/* MachineGuard palette */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #e9f0f2; /* cool white */
+  --foreground: #102a35; /* deep navy */
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-navy: #102a35; /* primary: text, header, charts */
+  --color-cool: #e9f0f2; /* secondary: page background */
+  --color-amber: #f2a541; /* highlights: fills and accents only, never text on light backgrounds */
+  --color-amber-ink: #9a5a0c; /* the same amber, dark enough for text on white */
+  --color-line: #c9d7dc; /* borders and dividers, a darker cool white */
+  --color-steel: #3f7891; /* idle status, between navy and cool white */
+  --font-sans: var(--font-roboto);
+  --font-mono: var(--font-roboto-mono);
 }
-
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+  font-family: var(--font-roboto), Arial, Helvetica, sans-serif;
+}
+
+/* Tailwind v4 dropped the pointer cursor on buttons; clickable things should show it. */
+@layer base {
+  button:not(:disabled),
+  [role="button"] {
+    cursor: pointer;
+  }
 }
