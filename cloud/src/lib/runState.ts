@@ -20,9 +20,10 @@ export type RunProfile = {
   abnormalAboveMmS: number; // above this it is shaking far more than normal running does
 };
 
-// Normal running topped out at 14.8 mm/s; 20 is ~35% above it. Rubbing on wood (21 - 40 mm/s) and
-// the off-balance fault test (82 - 88 mm/s) are both above it.
-export const DEFAULT_RUN_PROFILE: RunProfile = { offBelowMmS: 1.0, motorAboveHz: 15, abnormalAboveMmS: 20 };
+// 30 (Manraj, Sun Nov 8): about 2x the highest normal window (14.8 mm/s), so hard but normal drilling
+// shouldn't trip it; catches the heavier wood rubbing (up to 40 mm/s) and the off-balance fault test
+// (82 - 88 mm/s). Not yet checked against a minute of deliberately hard, normal drilling.
+export const DEFAULT_RUN_PROFILE: RunProfile = { offBelowMmS: 1.0, motorAboveHz: 15, abnormalAboveMmS: 30 };
 
 // The latest window says nothing about now if it's older than this (one every 10 s, plus slack).
 export const WINDOW_FRESH_MS = 30_000;

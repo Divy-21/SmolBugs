@@ -22,11 +22,11 @@ test("running, in the air or into wood: 8-15 mm/s, 67-166 Hz", () => {
   assert.equal(runState(5.92, 67.2), "running"); // 00:33:12, spinning up
 });
 
-test("rubbing on wood (01:27-01:35 UTC, 21-40 mm/s) is abnormal; normal never goes above 20", () => {
-  assert.equal(runState(40, 22), "abnormal");
-  assert.equal(runState(28, 193), "abnormal");
-  assert.equal(runState(21, 189), "abnormal");
-  assert.equal(runState(19.5, 190), "running"); // just under the line
+test("abnormal above 30 mm/s: heavy rubbing on wood (up to 40) and the fault test; lighter rubbing isn't", () => {
+  assert.equal(runState(40, 22), "abnormal"); // 01:33-01:35 UTC
+  assert.equal(runState(31, 35), "abnormal");
+  assert.equal(runState(28, 193), "running"); // light rubbing stays under the line
+  assert.equal(runState(29.5, 190), "running");
 });
 
 test("the fault test (something off-balance on the drill): ~85 mm/s at ~10 Hz is abnormal, not 'handled'", () => {
