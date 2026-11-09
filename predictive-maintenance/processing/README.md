@@ -8,12 +8,17 @@ This folder holds the **processing stage**: it takes raw vibration readings and 
 ESP32 (machine1)  →  Bluetooth  →  [ receiver → reassemble → FFT analysis ]  →  ML anomaly detection  →  dashboard
                                      ▲ you are here
 ```
+<img width="1494" height="881" alt="Screenshot 2026-11-08 223954" src="https://github.com/user-attachments/assets/b64a65cb-f4fc-4784-828e-4a6571aa1e3e" />
+
+
+<img width="1466" height="631" alt="Screenshot 2026-11-08 233034" src="https://github.com/user-attachments/assets/437e0632-e7f4-421b-9093-80a8f97b9155" />
+
 
 **Current status:** running on real hardware. A Pololu MinIMU-9 (LSM303D accelerometer) samples vibration at about 1,600 Hz, and a thermistor measures temperature. Both travel over Bluetooth to the receiver, which runs the FFT analysis.
 
 ## Why an FFT?
 
-The accelerometer records how the machine shakes over time, 4,000 times per second. As a raw waveform that's hard to interpret: everything is mixed together.
+The accelerometer records how the machine shakes over time, about 1,600 times per second. As a raw waveform that's hard to interpret: everything is mixed together.
 
 A **Fast Fourier Transform (FFT)** separates that waveform into its individual frequencies, the way a prism splits light into colours. Different mechanical problems show up at different frequencies:
 
@@ -21,12 +26,12 @@ A **Fast Fourier Transform (FFT)** separates that waveform into its individual f
 |---|---|
 | Big peak at **1× running speed** | Imbalance (e.g. a worn or unevenly loaded blade/wheel) |
 | Strong peak at **2× running speed** | Misalignment or looseness |
-| Raised energy at **high frequencies** (500–1000 Hz) | Impacts, often early bearing or gearbox damage |
+| Raised energy at **high frequencies** (120–360 Hz with the LSM303D) | Impacts, often early bearing or gearbox damage |
 | A **new peak** that wasn't there before | Something in a rotating component has changed |
 
 Running speed in Hz is simply `RPM / 60`, so a motor at 3,000 RPM has its 1× peak at 50 Hz.
 
-These are *possible* causes to investigate, not diagnoses. They still need to be confirmed against real machine data.
+These are *possible* causes to investigate, not diagnoses. The ML stage (`ml/`, see `ml/README.md`) learns what each fault actually looks like on our drill from real recordings.
 
 ## Folder layout
 
@@ -49,7 +54,8 @@ predictive-maintenance/
 │   ├── packet_simulator.py Fake healthy/faulty machine windows
 │   ├── fake_ble_board.py   Pretend Bluetooth board, for running without hardware
 │   └── fft_demo.py         Interactive demo: healthy vs faulty machine
-├── tests/                  164 automated tests
+├── ml/                     Features, training and the live detector (see ml/README.md)
+├── tests/                  Automated tests
 └── pytest.ini          Test configuration
 ```
 
@@ -64,11 +70,11 @@ E:\SmolBugs\.venv\Scripts\Activate.ps1
 #    If you get "running scripts is disabled", run this first:
 #    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
-# 2. Install dependencies (first time only)
-python -m pip install numpy scipy plotly pytest bleak
+# 2. Install dependencies (first time only; pandas, scikit-learn, joblib and matplotlib are for ml/)
+python -m pip install numpy scipy pandas scikit-learn joblib plotly matplotlib bleak pytest
 ```
 
-If the `.venv` folder doesn't exist yet, create it from `E:\SmolBugs` with `python -m venv .venv`.
+If the `.venv` folder doesn't exist yet, create it from `E:\SmolBugs` with `python -m venv .venv`. A virtual environment only works on the computer that created it: if activating it gives `No Python at '...'`, it was made on another computer, so delete `.venv` and create it again.
 
 ## Run the tests
 
@@ -76,7 +82,7 @@ If the `.venv` folder doesn't exist yet, create it from `E:\SmolBugs` with `pyth
 python -m pytest -q
 ```
 
-Expected result: `153 passed, 11 skipped` on Windows. The 11 skipped tests compile the ESP32 firmware on the PC and only run where a C++ compiler (`g++`) is installed; with one, all 164 run.
+Everything should pass. Some tests compile the ESP32 firmware on the PC and are skipped unless a C++ compiler (`g++`) is installed. `tests/test_ml.py` tests an old serial recorder that no longer exists and fails to import; run `python -m pytest -q --ignore=tests/test_ml.py` until it is removed.
 
 The FFT tests feed in signals where the right answer is already known (for example, "a 0.5 g vibration at exactly 123.37 Hz") and check that the FFT gets it back. They confirm that frequencies come out within 0.01 Hz and amplitudes within 0.5%.
 
@@ -115,6 +121,8 @@ Those match the values the simulation put in, which is how we know the processin
 
 ## Running the receiver
 
+Run it from the `predictive-maintenance` folder with the virtual environment active; from anywhere else Python reports `No module named 'ingest'`.
+
 The receiver connects to the board (Bluetooth name `MachineGuard`), prints every temperature reading and every vibration window's FFT results as they arrive, and can save everything to a folder.
 
 ```powershell
@@ -124,26 +132,34 @@ python -m ingest.ble_receiver --out data/session1      # save readings and raw w
 python -m ingest.ble_receiver --simulate               # fake board, no hardware needed
 ```
 
-Example output:
+Example output from the real board, sitting still:
 
 ```
 Connected. MTU: 247
-Temp  #   12 | 1582 mV |   69.06 kΩ |  33.57 °C
-Vib   window     0 | dominant   50.00 Hz @ 0.050 g | velocity 1.12 mm/s | 1x=0.050 2x=0.010 3x=0.001
+Temp  #   61 | 1337 mV |   51.08 kΩ |  40.92 °C | accel -0.366 -0.149 -0.819 g (total 0.91)
+Vib   window     4 | dominant    4.86 Hz @ 0.007 g | velocity 0.44 mm/s
 ```
+
+At rest the dominant peak is just sensor noise (a few thousandths of a g), and the total acceleration should be about 1 g (this sensor reads about 0.9 g). If every axis reads ±4 g, the sensor wiring is loose or the sensor is in a bad state: reseat SDA (GPIO2), SCL (GPIO4), VIN and GND and power-cycle the board.
 
 With `--out`, the folder gets `temperature.jsonl` and `vibration.jsonl` (one result per line) and a `windows/` folder of raw data (`.npz`), which will become training data for anomaly detection. Press Ctrl+C to stop; a summary of anything lost or rejected is printed at the end.
 
 ## Sending data to the cloud
 
-Add `--cloud` to send every status reading and analysed window to the SmolBugs cloud as well. The address and key come from environment variables, so the key never goes into a file or into git. In PowerShell:
+Add `--cloud` to send every status reading and analysed window to the SmolBugs cloud as well. The address defaults to the team's AWS deployment. Save the device key once per laptop, from the repo root (`E:\SmolBugs`):
 
 ```powershell
-$env:CLOUD_URL  = "https://sm-db6bb08ece0d477c9e820f118f7e670c.ecs.ca-central-1.on.aws"
-$env:DEVICE_KEY = "paste-the-key-here"      # lasts until this window is closed
-python -m ingest.ble_receiver --cloud --rpm 3000
+Set-Content smolbugs.env "DEVICE_KEY=paste-the-key-here"
+```
+
+The file must contain `DEVICE_KEY=` in front of the key; a bare key is ignored. `.gitignore` keeps `smolbugs.env` out of git. The `DEVICE_KEY` and `CLOUD_URL` environment variables override the file. Never paste the key into chats or commits.
+
+```powershell
+python -m ingest.ble_receiver --cloud
 python -m ingest.ble_receiver --cloud --simulate    # try it without the board
 ```
+
+At the start it prints `Cloud upload: https://…on.aws`; the summary at the end should show `waiting 0` and `rejected (400) 0`.
 
 Status readings go to `POST /api/v1/status` and windows (the `analyze_window` results, plus the latest `temperature_c`) to `POST /api/v1/windows`, with the key in the `x-device-key` header.
 
@@ -166,25 +182,26 @@ Sensor values are deliberately not part of the ID: two real readings can have id
 
 ## Viewing the FFT from the board
 
-Record with `--out`, then build an interactive report from what was saved:
+Build a report for any saved folder, including the training runs recorded by `ml.record`:
 
 ```powershell
-python -m ingest.ble_receiver --rpm 3000 --out data/session1      # Ctrl+C when done
-python -m ingest.fft_report data/session1 --rpm 3000
-start data/session1/fft_report.html
+python -m ingest.fft_report data\raw\S1_loose_bit_01
+start data\raw\S1_loose_bit_01\fft_report.html
 ```
 
-Or keep the report updating live while recording. Open it once and it reloads itself every 5 seconds:
+Or watch it live. Save to a folder outside `data\raw` (such as `data\live`) so this data never mixes with training data:
 
 ```powershell
-python -m ingest.ble_receiver --rpm 3000 --out data/session1 --live-html
-start data/session1/fft_report.html          # in a second terminal
+python -m ingest.ble_receiver --out data\live --live-html          # terminal 1, keep it running
+start data\live\fft_report.html                                  # terminal 2, after the first "Vib window" line
 ```
+
+The page only exists once the first window has arrived (10–20 s), and it reloads itself every 5 seconds. It needs its own terminal because the receiver keeps the first one busy until Ctrl+C. Add `--cloud` to upload at the same time.
 
 The report shows the latest window (or `--window N` for a specific one):
 
 1. **Raw vibration:** the first 0.2 s of each axis, with gravity removed.
-2. **FFT amplitude spectrum:** with dotted 1×/2×/3× running-speed lines when `--rpm` is given.
+2. **FFT amplitude spectrum:** with dotted 1×/2×/3× running-speed lines when `--rpm` is given (the drill's RPM). The axis goes up to 800 Hz, but above about 360 Hz the sensor's filter removes almost everything.
 3. **Welch PSD:** the smoothed energy spectrum, on a log scale.
 4. **Velocity RMS per window:** how overall vibration changes across the session.
 5. **Temperature:** every reading in the session.
@@ -239,7 +256,9 @@ Settings near the top of the sketch:
 
 ## Temperature
 
-The board sends `sequence,voltage_mV,resistance_ohms` twice a second. The receiver converts the voltage to °C with the Beta equation for an NTC thermistor.
+The board sends `sequence,voltage_mV,x_g,y_g,z_g` twice a second (older firmware sent `sequence,voltage_mV,resistance_ohms`; both are understood). The receiver converts the voltage to °C with the Beta equation for an NTC thermistor.
+
+**The reading is not trusted yet.** It shows about 41 °C at room temperature. GPIO1 is also the Heltec WiFi LoRa 32 V3's battery-voltage pin, which most likely explains it. Move the thermistor to a free ADC1 pin and check it against a thermometer before using temperature for anything.
 
 The circuit is 3.3 V → 75 kΩ fixed resistor → ADC pin (GPIO1) → thermistor → ground, taken from `machine1.ino`. **The thermistor's own values are still assumptions:** 100 kΩ at 25 °C with Beta 3950. A 10 kΩ part can't explain the ~69 kΩ being measured at room temperature, but the exact part should be confirmed from its datasheet. Change the values with `ThermistorConfig`:
 
@@ -310,7 +329,7 @@ Velocity RMS: 4.43 mm/s
 
 ## Settings
 
-All in `FFTConfig` (`processing/config.py`):
+All in `FFTConfig` (`processing/config.py`). **The defaults were written for the ADXL355 at 4,000 Hz**, and the receiver's live printout and `fft_report` still use them. They analyse each window at its own measured sample rate (about 1,600 Hz), so frequencies are right, but the bands above 360 Hz stay near zero with the LSM303D. The ML stage uses `DRILL_FFT` in `ml/settings.py` instead: 1,600 Hz, 1,024-sample windows, bands 2–40, 40–120 and 120–360 Hz.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -329,7 +348,8 @@ All in `FFTConfig` (`processing/config.py`):
 ## Known limitations and next steps
 
 - **Frequency bands are generic placeholders.** The 50 Hz band edge lands exactly on the 1× peak of a 3,000 RPM motor, splitting its energy across two bands (visible in the example output above). Bands should be tuned per machine once the real RPMs of the band saw and drill are measured, so each harmonic sits inside a single band.
-- **Vibration uses a test signal until the ADXL355 arrives.** Then: write the sensor driver in `captureWindow()`, measure its real sample rate, and record healthy baselines from each machine.
+- **The receiver and report use the generic ADXL355 defaults** (see Settings). Switching them to the drill's 1,600 Hz settings would make the printed bands match what the sensor can see.
+- **The drill's running speed is not confirmed.** The ML stage estimates about 110 Hz (6,600 RPM), which is high for a drill; it may be locking onto the motor or gears. Check it against the drill's rated RPM.
 - **Firmware testing on the PC uses stand-ins for the Arduino and Bluetooth libraries.** The real check is uploading to the board and running the receiver.
 - **Thermistor values are assumed** until confirmed from the part's datasheet.
-- Feature extraction (RMS, kurtosis, crest factor), storage, and anomaly detection are planned but not part of this module yet.
+- Feature extraction, training and anomaly detection now live in `ml/` (see `ml/README.md`). The trained model does not run on live board data yet; `ml.live_check` replays recordings through it.
