@@ -11,6 +11,7 @@ natHacks 2026, Standard Division, Construction and Manufacturing theme.
 ## The problem
 
 Small shops run drills, saws and lathes until they fail: in Canada, 19% of businesses say they run equipment until it fails (ABB "Value of Reliability" survey, 2023). Condition monitoring exists, but it's sold to large plants with reliability engineers (for example Nanoprecise, Augury and SKF). A shop with no maintenance team finds out when the tool stops, the part is ruined or someone gets hurt.
+https://www.ebmag.com/19-of-canadian-businesses-still-rely-on-run-to-fail-maintenance-survey/
 
 ## What MachineGuard does
 
