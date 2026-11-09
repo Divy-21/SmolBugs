@@ -23,10 +23,13 @@ export type ActivityConfig = {
 
 // Idle default: the real drill (MG-001) read about 0.01 g of spread while idle and
 // 0.36 g or more while running (Sat Nov 7), so 0.05 g separates them with room.
+// Window 10 readings (5 s), was 20: back to idle ~12 s after the machine stops, instead of ~20 s.
+// Real running data (Sun Nov 8, ~1,700 readings) never dipped under 0.05 g over 10 readings
+// (lowest 0.24 g), so a running drill doesn't flicker to idle.
 export const DEFAULT_ACTIVITY: ActivityConfig = {
   offlineAfterMs: 15_000,
   idleSpreadMaxG: 0.05,
-  window: 20,
+  window: 10,
 };
 
 export function activityConfigFromEnv(env: Record<string, string | undefined> = process.env): ActivityConfig {
