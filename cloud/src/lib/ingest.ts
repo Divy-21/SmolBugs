@@ -2,6 +2,8 @@ import { z } from "zod";
 import { checkDeviceKey } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { vibrationWindow, type VibrationWindow } from "@/lib/packets";
+import { WINDOW_FRESH_MS, runState } from "@/lib/runState";
+import { streamBuffer } from "@/lib/streamStore";
 import type { Prisma } from "@/generated/prisma/client";
 
 type Tx = Prisma.TransactionClient;
@@ -15,6 +17,9 @@ export async function ingest<T extends z.ZodType>(
   schema: T,
   // Returns how many rows were actually written (repeats are skipped).
   store: (tx: Tx, packets: z.infer<T>[]) => Promise<number>,
+  // Runs once the rows are committed. A failure here is logged, never turned into an error answer:
+  // the data is already stored, and a retry would only be skipped as a duplicate.
+  afterCommit?: (packets: z.infer<T>[]) => Promise<void>,
 ): Promise<Response> {
   const denied = checkDeviceKey(request);
   if (denied) return denied;
@@ -44,6 +49,13 @@ export async function ingest<T extends z.ZodType>(
     await touchMachines(tx, packets as { machine_id: string }[]);
     return store(tx, packets);
   });
+  if (afterCommit) {
+    try {
+      await afterCommit(packets);
+    } catch (err) {
+      console.error(`after storing ${packets.length} packet(s): ${(err as Error).message}`);
+    }
+  }
   // A packet whose packet_id is already stored (the gateway retried after a
   // timeout that actually succeeded) is skipped and counted, not an error.
   return Response.json({ ok: true, stored, duplicates: packets.length - stored });
@@ -92,4 +104,23 @@ export const windowRoute = (request: Request) =>
       }),
     });
     return count;
-  });
+  }, judgeWindows);
+
+// Each fresh window goes to the alert logic (lib/stream.ts addWindow): a window far above normal
+// running, twice in a row, opens a vibration alert. Windows more than WINDOW_FRESH_MS old (an old
+// recording uploaded later, or a big clock difference) are stored but never alert.
+async function judgeWindows(windows: VibrationWindow[]): Promise<void> {
+  const buffer = streamBuffer();
+  const now = Date.now();
+  const urgent = new Set<string>();
+  for (const w of windows) {
+    const at = w.received_at_utc ? new Date(w.received_at_utc) : new Date();
+    if (Math.abs(now - at.getTime()) > WINDOW_FRESH_MS) continue;
+    const axes = [w.axes.x, w.axes.y, w.axes.z];
+    const peak = axes.reduce((a, b) => (b.dominant_amp_g > a.dominant_amp_g ? b : a));
+    const velocity = Math.max(...axes.map((a) => a.velocity_rms_mm_s));
+    const abnormal = runState(velocity, peak.dominant_freq_hz) === "abnormal";
+    if (buffer.addWindow(w.machine_id, at, abnormal, w.packet_id ?? null).flushNow) urgent.add(w.machine_id);
+  }
+  for (const id of urgent) await buffer.flush(id); // write the alert now, so the phone hears it now
+}

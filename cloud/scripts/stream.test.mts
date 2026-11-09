@@ -30,7 +30,7 @@ function reading(over: Partial<IncomingReading> = {}): IncomingReading {
     thermistorMv: 1582, // about 33.6 °C with the default constants
     thermistorValid: true,
     temperatureC: null,
-    accel: { x: 0.01, y: -0.01, z: 1.0 },
+    accel: { x: 0.01 + (tick % 5) * 0.001, y: -0.01, z: 1.0 }, // a real sensor never repeats exactly
     accelValid: true,
     payload: {},
     ...over,
@@ -165,6 +165,74 @@ test("sensor faults: firmware valid=false, all-zero accelerometer, thermistor at
   const z = evaluate(reading({ accel: { x: 0, y: 0, z: 0 }, thermistorMv: 3299 }), [], cfg);
   assert.deepEqual(z.flags, ["thermistor_fault", "accel_fault"]);
   assert.equal(z.temperatureC, null);
+});
+
+test("a stuck accelerometer (same reading again and again) is a sensor fault, not a shock", () => {
+  // MG-001-TEST, Sun Nov 8: a wire came loose and the board kept sending its last value, then
+  // (-3.997, 3.902, -3.997): the sensor's ±4 g limit, which reads as a huge shock.
+  const buf = new StreamBuffer(recorder().persist, cfg);
+  const stuck = { x: -3.997, y: 3.902, z: -3.997 };
+  const flags: string[][] = [];
+  for (let i = 0; i < 12; i++) flags.push(buf.add(reading({ machineId: "MG-002", accel: stuck })).flags);
+  assert.deepEqual(flags[0], ["shock"]); // first sight of it: could be a real knock
+  assert.deepEqual(flags[1], []); // a repeat is no new shock
+  assert.deepEqual(flags[4], ["accel_fault"]); // 5 identical in a row: stuck
+  assert.deepEqual(flags[11], ["accel_fault"]);
+  const s = buf.machines.get("MG-002")!;
+  assert.equal(s.events.length, 1);
+  const e = s.events[0];
+  assert.ok(e.type === "open" && e.kind === "sensor_fault" && e.severity === "watch", JSON.stringify(e));
+});
+
+test("a frozen reading at a normal value is caught too; real noise and short repeats are not", () => {
+  const buf = new StreamBuffer(recorder().persist, cfg);
+  let flags: string[] = [];
+  for (let i = 0; i < 6; i++) flags = buf.add(reading({ machineId: "MG-003", accel: { x: -0.21, y: -0.944, z: -0.3 } })).flags;
+  assert.deepEqual(flags, ["accel_fault"]);
+  // two identical in a row happens in real data; it must not count as stuck
+  const ok = new StreamBuffer(recorder().persist, cfg);
+  for (let i = 0; i < 30; i++) {
+    const x = Math.floor(i / 2) % 7 === 0 ? 0.02 : 0.01 + (i % 9) * 0.001; // pairs repeat now and then
+    flags = ok.add(reading({ machineId: "MG-003", accel: { x, y: -0.01, z: 1.0 } })).flags;
+    assert.ok(!flags.includes("accel_fault"), `reading ${i}: ${flags}`);
+  }
+});
+
+test("vibration windows: 2 abnormal in a row open an alert, 2 normal close it; a retry isn't counted", () => {
+  const buf = new StreamBuffer(recorder().persist, cfg);
+  const at = (i: number) => new Date(T0 + i * 10_000);
+  assert.equal(buf.addWindow("MG-001", at(1), true, "w1").flushNow, false); // one could be a bump
+  assert.equal(buf.addWindow("MG-001", at(1), true, "w1").flushNow, false); // the same window again
+  assert.equal(buf.machines.get("MG-001")!.events.length, 0);
+  assert.equal(buf.addWindow("MG-001", at(2), true, "w2").flushNow, true); // second in a row: alert
+  const s = buf.machines.get("MG-001")!;
+  const e = s.events[0];
+  assert.ok(e.type === "open" && e.kind === "vibration" && e.severity === "alert", JSON.stringify(e));
+  assert.match((e as { message: string }).message, /vibration_severe/);
+  assert.equal(buf.addWindow("MG-001", at(3), false, "w3").flushNow, false);
+  assert.equal(buf.addWindow("MG-001", at(4), false, "w4").flushNow, true); // 2 normal: closed
+  assert.deepEqual(s.events.map((x) => x.type), ["open", "resolve"]);
+});
+
+test("status packets can't close an alert the windows still see, and the other way round", () => {
+  const buf = new StreamBuffer(recorder().persist, cfg);
+  const at = (i: number) => new Date(T0 + i * 10_000);
+  buf.addWindow("MG-002", at(1), true);
+  buf.addWindow("MG-002", at(2), true); // open, from the windows
+  for (let i = 0; i < 10; i++) buf.add(reading({ machineId: "MG-002" })); // 10 normal status packets
+  const s = buf.machines.get("MG-002")!;
+  assert.deepEqual(s.events.map((x) => x.type), ["open"]); // still open: windows say abnormal
+  buf.addWindow("MG-002", at(3), false);
+  buf.addWindow("MG-002", at(4), false);
+  assert.deepEqual(s.events.map((x) => x.type), ["open", "resolve"]);
+
+  // opened by hot status packets; normal windows alone don't close it
+  const b2 = new StreamBuffer(recorder().persist, cfg);
+  for (let i = 0; i < 3; i++) b2.add(hot());
+  for (let i = 0; i < 4; i++) b2.addWindow("MG-001", at(10 + i), i < 2);
+  b2.addWindow("MG-001", at(20), false);
+  b2.add(hot());
+  assert.deepEqual(b2.machines.get("MG-001")!.events.map((x) => x.type), ["open"]);
 });
 
 test("a packet with only some sensors is fine", () => {

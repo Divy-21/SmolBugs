@@ -12,6 +12,7 @@ const FLAG_WORDS: Record<string, string> = {
   temp_high: "temperature above its limit",
   temp_rising: "temperature rising fast",
   vibration_high: "vibration above its limit",
+  vibration_severe: "vibration far above normal running",
   shock: "sudden shock",
   thermistor_fault: "temperature sensor fault",
   accel_fault: "accelerometer fault",

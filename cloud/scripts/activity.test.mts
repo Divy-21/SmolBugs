@@ -68,6 +68,13 @@ test("only the newest readings decide idle vs online", () => {
   assert.equal(classifyActivity(r[0].receivedAt, r, NOW).state, "idle");
 });
 
+test("idle 5 s after it stops: 10 still readings are enough", () => {
+  const r = [...readings(10, 0.01), ...readings(40, 0.5, 5_500)];
+  assert.equal(classifyActivity(r[0].receivedAt, r, NOW).state, "idle");
+  const moving = [...readings(9, 0.01), ...readings(40, 0.5, 5_000)]; // only 9 still: not yet
+  assert.equal(classifyActivity(moving[0].receivedAt, moving, NOW).state, "online");
+});
+
 test("limits can be set from the environment", () => {
   const c = activityConfigFromEnv({ OFFLINE_AFTER_S: "30", IDLE_SPREAD_MAX_G: "0.1" });
   assert.equal(c.offlineAfterMs, 30_000);
